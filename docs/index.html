@@ -203,7 +203,10 @@
   <script>
     async function loadStatusJson() {
       try {
-        const resp = await fetch('./status.json?t=' + Date.now());
+        let resp = await fetch('https://raw.githubusercontent.com/waghharesh/bountysweep-agent/main/docs/status.json?t=' + Date.now());
+        if (!resp.ok) {
+          resp = await fetch('./status.json?t=' + Date.now());
+        }
         if (!resp.ok) return;
         const data = await resp.json();
         const m = data.metrics || {};
