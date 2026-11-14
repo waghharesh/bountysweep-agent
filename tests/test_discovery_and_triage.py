@@ -385,3 +385,134 @@ async def test_non_usdc_ledger_prefilter_skips_mrg_and_allows_base_usdc() -> Non
     assert results[0].escrow_verified is True
     assert results[0].escrow_provider == "base-usdc"
 
+
+@pytest.mark.asyncio
+async def test_aggregator_digest_filter_and_verified_escrow_bot_signatures() -> None:
+    """Scanner must ignore github-actions[bot] / 'bounty-alert' issues and detect algora-pbc[bot] / opire-bot[bot]."""
+    from discovery.scanner import (
+        has_verified_escrow_signature_or_marker,
+        is_aggregator_or_digest_issue,
+    )
+
+    # 1. Aggregator / digest issues skipped
+    gh_actions_issue = {
+        "number": 101,
+        "title": "Daily Paid Bounties Digest ($500)",
+        "body": "Automated list of open issues",
+        "user": {"login": "github-actions[bot]"},
+        "labels": [{"name": "bounty"}, {"name": "python"}],
+    }
+    assert is_aggregator_or_digest_issue(gh_actions_issue) is True
+
+    bounty_alert_label_issue = {
+        "number": 102,
+        "title": "New Python Bounty Opportunity ($200)",
+        "body": "Check out this issue",
+        "user": {"login": "some-user"},
+        "labels": [{"name": "bounty"}, {"name": "bounty-alert"}],
+    }
+    assert is_aggregator_or_digest_issue(bounty_alert_label_issue) is True
+
+    # 2. Verified escrow bot signatures detected
+    algora_bot_issue = normalize_github_issue(
+        {
+            "number": 201,
+            "repo_owner": "acme",
+            "repo_name": "api",
+            "title": "Fix async FastAPI middleware timeout ($175)",
+            "body": "Reproduce with pytest and fix timeout handling.",
+            "user": {"login": "algora-pbc[bot]"},
+            "labels": ["bounty", "python", "fastapi"],
+        }
+    )
+    assert algora_bot_issue.escrow_verified is True
+    assert algora_bot_issue.escrow_provider == "algora"
+    assert has_verified_escrow_signature_or_marker(algora_bot_issue) is True
+
+    opire_comment_issue = normalize_github_issue(
+        {
+            "number": 202,
+            "repo_owner": "acme",
+            "repo_name": "parser",
+            "title": "Fix JSON parser edge case ($120)",
+            "body": "Fix parser bug and add pytest test.",
+            "user": {"login": "maintainer"},
+            "comments_list": [
+                {"user": {"login": "opire-bot[bot]"}, "body": "An escrow of $120 has been created on opire.dev"}
+            ],
+            "labels": ["bounty", "python"],
+        }
+    )
+    assert opire_comment_issue.escrow_verified is True
+    assert has_verified_escrow_signature_or_marker(opire_comment_issue) is True
+
+
+@pytest.mark.asyncio
+async def test_poll_batch_iterates_up_to_15_candidates_and_caches_rejections(tmp_path) -> None:
+    """poll_verified_batch_until_approved iterates up to 15 unseen candidates, caching rejections until one is approved."""
+    from discovery.scanner import BountyBoardAdapter, SeenBountiesCache
+
+    # Create 18 unseen candidates:
+    # - First 4 lack verified escrow markers (filtered before triage)
+    # - 5th has verified escrow via algora-pbc[bot] and strong Python/FastAPI fit (approved!)
+    # - Remaining 13 should not even need evaluation once #5 is approved
+    candidates: list[BountyOpportunity] = []
+    for i in range(1, 5):
+        candidates.append(
+            BountyOpportunity(
+                bounty_id=f"github:unverified/repo#{i}",
+                platform="github",
+                repo_owner="unverified",
+                repo_name="repo",
+                repo_url="https://github.com/unverified/repo",
+                issue_number=i,
+                issue_url=f"https://github.com/unverified/repo/issues/{i}",
+                title=f"Unverified issue #{i}",
+                body="No escrow marker here",
+                labels=["bounty", "python"],
+                reward_usdc=0.0,
+                escrow_verified=False,
+            )
+        )
+
+    approved_candidate = generate_mock_escrowed_bounty()
+    candidates.append(approved_candidate)
+
+    for i in range(6, 19):
+        candidates.append(
+            BountyOpportunity(
+                bounty_id=f"github:extra/repo#{i}",
+                platform="github",
+                repo_owner="extra",
+                repo_name="repo",
+                repo_url="https://github.com/extra/repo",
+                issue_number=i,
+                issue_url=f"https://github.com/extra/repo/issues/{i}",
+                title=f"Extra issue #{i}",
+                body="No escrow",
+                labels=["bounty"],
+                reward_usdc=0.0,
+                escrow_verified=False,
+            )
+        )
+
+    class _BatchAdapter(BountyBoardAdapter):
+        async def fetch_open_bounties(self) -> list[BountyOpportunity]:
+            return candidates
+
+    cache = SeenBountiesCache(cache_path=tmp_path / "batch_seen.json", ttl_seconds=86_400)
+    scanner = BountyScanner(adapters=[_BatchAdapter()], seen_cache=cache, max_candidates_per_cycle=15)
+    # Force original ordering without sorting so we test rejecting unverified items before hitting approved_candidate
+    scanner.scan_all = AsyncMock(return_value=candidates)  # type: ignore[method-assign]
+
+    engine = BountyTriageEngine(settings=Settings(DRY_RUN_MODE=True, MIN_TRIAGE_SCORE=70))
+    win_bounty, win_triage, log = await scanner.poll_verified_batch_until_approved(engine, max_candidates=15)
+
+    assert win_bounty is not None
+    assert win_bounty.bounty_id == approved_candidate.bounty_id
+    assert win_triage is not None and win_triage.approved is True
+    assert len(log) == 5
+    for i in range(1, 5):
+        assert cache.is_seen(f"github:unverified/repo#{i}") is True
+
+

@@ -20,6 +20,36 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SEEN_CACHE_TTL_SECONDS = 86_400  # 24 hours
 DEFAULT_SEEN_CACHE_PATH = Path("/tmp/bountysweep_seen_bounties.json")
+MAX_CANDIDATES_PER_CYCLE = 15
+
+VERIFIED_ESCROW_BOT_LOGINS: frozenset[str] = frozenset(
+    {
+        "algora-pbc[bot]",
+        "algora[bot]",
+        "opire-bot[bot]",
+        "opire[bot]",
+        "polar-sh[bot]",
+        "polar[bot]",
+        "gitcoinbot",
+        "gitcoin[bot]",
+        "bountycaster[bot]",
+    }
+)
+
+AGGREGATOR_BOT_LOGINS: frozenset[str] = frozenset(
+    {
+        "github-actions[bot]",
+        "github-actions",
+    }
+)
+
+AGGREGATOR_LABELS: frozenset[str] = frozenset(
+    {
+        "bounty-alert",
+        "bounty-digest",
+        "automated-digest",
+    }
+)
 
 _REWARD_DOLLAR_RE = re.compile(
     r"(?:💎|/bounty|bounty[:\s]+|reward[:\s]+|\bUSD[C]?\s*)\s*\$\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)"
@@ -41,6 +71,17 @@ _NON_USDC_LEDGER_RE = re.compile(
     re.IGNORECASE,
 )
 
+_EXPLICIT_USDC_OR_BASE_ESCROW_RE = re.compile(
+    r"(?:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913|"
+    r"\[escrow:(?:verified|base|algora|opire|polar|gitcoin|bountycaster|dework|superteam)\]|"
+    r"algora-pbc\[bot\]|opire-bot\[bot\]|polar-sh\[bot\]|"
+    r"console\.algora\.io|algora\.io|opire\.dev|polar\.sh|bountycaster\.xyz|"
+    r"/bounty\s+\$\s*[0-9]+|💎\s*\$\s*[0-9]+|"
+    r"\b[0-9][0-9,]*(?:\.[0-9]{1,2})?\s*USDC\b[^\n]{0,60}\b(?:Base|escrow|escrowed|verified)\b|"
+    r"\b(?:Base|escrow|escrowed)\b[^\n]{0,60}\b[0-9][0-9,]*(?:\.[0-9]{1,2})?\s*USDC\b)",
+    re.IGNORECASE,
+)
+
 _ESCROW_PROVIDER_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
         "base-usdc",
@@ -50,9 +91,27 @@ _ESCROW_PROVIDER_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
             re.IGNORECASE,
         ),
     ),
-    ("algora", re.compile(r"(?:console\.algora\.io|algora\.io|/bounty\s+\$|💎\s*\$|\[escrow:algora\])", re.IGNORECASE)),
-    ("polar", re.compile(r"(?:polar\.sh|\[escrow:polar\])", re.IGNORECASE)),
-    ("opire", re.compile(r"(?:opire\.dev|\[escrow:opire\])", re.IGNORECASE)),
+    (
+        "algora",
+        re.compile(
+            r"(?:algora-pbc\[bot\]|console\.algora\.io|algora\.io|/bounty\s+\$|💎\s*\$|\[escrow:algora\])",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "opire",
+        re.compile(
+            r"(?:opire-bot\[bot\]|opire\.dev|\[escrow:opire\])",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "polar",
+        re.compile(
+            r"(?:polar-sh\[bot\]|polar\.sh|\[escrow:polar\])",
+            re.IGNORECASE,
+        ),
+    ),
     ("gitcoin", re.compile(r"(?:gitcoin\.co|\[escrow:gitcoin\])", re.IGNORECASE)),
     ("bountycaster", re.compile(r"(?:bountycaster\.xyz|\[escrow:bountycaster\])", re.IGNORECASE)),
     ("dework", re.compile(r"(?:dework\.xyz|\[escrow:dework\])", re.IGNORECASE)),
@@ -202,6 +261,124 @@ class SeenBountiesCache:
         return dict(self._entries)
 
 
+def is_aggregator_or_digest_issue(
+    issue_data_or_bounty: dict[str, Any] | BountyOpportunity,
+) -> bool:
+    """Return True if an issue is created by github-actions[bot], labeled 'bounty-alert', or is an aggregator digest."""
+    if isinstance(issue_data_or_bounty, BountyOpportunity):
+        raw = issue_data_or_bounty.raw_metadata or {}
+        labels = [lbl.strip().lower() for lbl in issue_data_or_bounty.labels]
+        title = issue_data_or_bounty.title
+        body = issue_data_or_bounty.body
+        repo_owner = issue_data_or_bounty.repo_owner
+    else:
+        raw = issue_data_or_bounty
+        raw_labels = raw.get("labels") or []
+        if isinstance(raw_labels, dict) and "nodes" in raw_labels:
+            raw_labels = raw_labels["nodes"]
+        labels = [
+            str(lbl.get("name") if isinstance(lbl, dict) else lbl).strip().lower()
+            for lbl in raw_labels
+        ]
+        title = str(raw.get("title") or "")
+        body = str(raw.get("body") or "")
+        repo_owner = str(raw.get("repo_owner") or "")
+
+    user_obj = raw.get("user") or raw.get("author") or {}
+    user_login = (
+        str(user_obj.get("login") if isinstance(user_obj, dict) else user_obj or "")
+        .strip()
+        .lower()
+    )
+    if user_login in AGGREGATOR_BOT_LOGINS:
+        return True
+
+    if any(lbl in AGGREGATOR_LABELS for lbl in labels):
+        return True
+
+    combined = f"{title}\n{body}\n{repo_owner}"
+    if re.search(
+        r"(?:\bBountyScout\b|\bAF\s+alert:\s*\d+\s+new\s+paid\s+opportunit|🎯\s*Bounty\s+Alert:)",
+        combined,
+        re.IGNORECASE,
+    ):
+        return True
+
+    return False
+
+
+def has_verified_escrow_signature_or_marker(
+    issue_data_or_bounty: dict[str, Any] | BountyOpportunity,
+) -> bool:
+    """Check for verified escrow bot signatures (e.g., algora-pbc[bot], opire-bot[bot]) or explicit USDC/Base escrow markers."""
+    if isinstance(issue_data_or_bounty, BountyOpportunity):
+        bounty = issue_data_or_bounty
+        raw = bounty.raw_metadata or {}
+        labels = bounty.labels
+        title = bounty.title
+        body = bounty.body
+        if bounty.platform in {"algora", "onchain"} and bounty.escrow_verified and bounty.reward_usdc > 0:
+            return True
+        if bounty.escrow_verified and bounty.escrow_provider and bounty.reward_usdc > 0:
+            return True
+    else:
+        raw = issue_data_or_bounty
+        raw_labels = raw.get("labels") or []
+        if isinstance(raw_labels, dict) and "nodes" in raw_labels:
+            raw_labels = raw_labels["nodes"]
+        labels = [
+            str(lbl.get("name") if isinstance(lbl, dict) else lbl)
+            for lbl in raw_labels
+        ]
+        title = str(raw.get("title") or "")
+        body = str(raw.get("body") or "")
+        if bool(raw.get("escrow_verified")) and float(raw.get("reward_usdc") or 0.0) > 0:
+            return True
+
+    # 1. Check author / bot login or comment authors in raw metadata
+    user_obj = raw.get("user") or raw.get("author") or {}
+    user_login = (
+        str(user_obj.get("login") if isinstance(user_obj, dict) else user_obj or "")
+        .strip()
+        .lower()
+    )
+    if user_login in VERIFIED_ESCROW_BOT_LOGINS:
+        return True
+
+    escrow_bot = str(raw.get("escrow_bot") or raw.get("bot_signature") or "").strip().lower()
+    if escrow_bot in VERIFIED_ESCROW_BOT_LOGINS:
+        return True
+
+    comments_list = raw.get("comments_list") or raw.get("comments_data") or []
+    if isinstance(comments_list, list):
+        for comment in comments_list:
+            if isinstance(comment, dict):
+                c_user = comment.get("user") or comment.get("author") or {}
+                c_login = (
+                    str(c_user.get("login") if isinstance(c_user, dict) else c_user or "")
+                    .strip()
+                    .lower()
+                )
+                c_body = str(comment.get("body") or "")
+                if c_login in VERIFIED_ESCROW_BOT_LOGINS:
+                    return True
+                if _EXPLICIT_USDC_OR_BASE_ESCROW_RE.search(c_body):
+                    return True
+
+    # 2. Check labels and issue text for explicit escrow bot signatures or Base/USDC escrow markers
+    if any("💎" in lbl and ("$" in lbl or "usdc" in lbl.lower()) for lbl in labels):
+        return True
+
+    combined = f"{' '.join(labels)}\n{title}\n{body}"
+    if _PROMISE_TO_PAY_RE.search(combined):
+        return False
+
+    if _EXPLICIT_USDC_OR_BASE_ESCROW_RE.search(combined):
+        return True
+
+    return False
+
+
 def is_non_usdc_ledger_bounty(
     title: str,
     body: str,
@@ -219,8 +396,6 @@ def is_non_usdc_ledger_bounty(
     )
     if not _NON_USDC_LEDGER_RE.search(combined):
         return False
-    # If it explicitly specifies a real USDC/USD amount > 0 with verified escrow, allow it;
-    # otherwise filter it out as a non-USDC ledger/points issue.
     has_real_usdc = bool(_USDC_AMOUNT_RE.search(combined) or _REWARD_DOLLAR_RE.search(combined))
     if has_real_usdc and "[$0]" not in combined.lower():
         return False
@@ -270,7 +445,7 @@ def parse_reward_usd_from_text(text: str) -> float:
 def normalize_github_issue(issue_data: dict[str, Any]) -> BountyOpportunity:
     """Normalize a GitHub REST or GraphQL issue payload into a BountyOpportunity.
 
-    Explicitly verifies escrow markers and rejects unfunded / 'promise-to-pay' / non-USDC ledger issues.
+    Explicitly verifies escrow bot signatures/markers and rejects unfunded / 'promise-to-pay' / non-USDC ledger issues.
     """
     raw_labels = issue_data.get("labels", [])
     if isinstance(raw_labels, dict) and "nodes" in raw_labels:
@@ -328,8 +503,10 @@ def normalize_github_issue(issue_data: dict[str, Any]) -> BountyOpportunity:
     if not html_url:
         html_url = f"{repo_url}/issues/{issue_number}"
 
-    # Check non-USDC ledger token filter (e.g., MRG)
-    non_usdc_ledger = is_non_usdc_ledger_bounty(title, body, labels, repo_owner=repo_owner)
+    # Check non-USDC ledger token or aggregator/digest filter
+    non_usdc_or_aggregator = is_non_usdc_ledger_bounty(
+        title, body, labels, repo_owner=repo_owner
+    ) or is_aggregator_or_digest_issue(issue_data)
 
     # Parse reward from explicit metadata, labels, or body
     reward_usdc = 0.0
@@ -337,7 +514,7 @@ def normalize_github_issue(issue_data: dict[str, Any]) -> BountyOpportunity:
         reward_usdc = float(issue_data["reward_usdc"])
     elif "reward_cents" in issue_data and issue_data["reward_cents"] is not None:
         reward_usdc = round(float(issue_data["reward_cents"]) / 100.0, 2)
-    elif not non_usdc_ledger:
+    elif not non_usdc_or_aggregator:
         for lbl in labels:
             amt = parse_reward_usd_from_text(lbl)
             if amt > 0:
@@ -352,27 +529,46 @@ def normalize_github_issue(issue_data: dict[str, Any]) -> BountyOpportunity:
     escrow_provider: str | None = issue_data.get("escrow_provider")
     explicit_escrow_flag = issue_data.get("escrow_verified")
 
+    user_obj = issue_data.get("user") or issue_data.get("author") or {}
+    user_login = (
+        str(user_obj.get("login") if isinstance(user_obj, dict) else user_obj or "")
+        .strip()
+        .lower()
+    )
+    escrow_bot = str(issue_data.get("escrow_bot") or issue_data.get("bot_signature") or "").strip().lower()
+
     if not escrow_provider:
-        for provider_name, pattern in _ESCROW_PROVIDER_PATTERNS:
-            if pattern.search(combined_text):
-                escrow_provider = provider_name
-                break
+        if "algora" in user_login or "algora" in escrow_bot:
+            escrow_provider = "algora"
+        elif "opire" in user_login or "opire" in escrow_bot:
+            escrow_provider = "opire"
+        elif "polar" in user_login or "polar" in escrow_bot:
+            escrow_provider = "polar"
+        else:
+            for provider_name, pattern in _ESCROW_PROVIDER_PATTERNS:
+                if pattern.search(combined_text):
+                    escrow_provider = provider_name
+                    break
 
     has_diamond_amount_label = any("💎" in lbl and ("$" in lbl or "usdc" in lbl.lower()) for lbl in labels)
     if has_diamond_amount_label and not escrow_provider:
         escrow_provider = "algora"
 
-    if non_usdc_ledger:
+    has_verified_marker = has_verified_escrow_signature_or_marker(issue_data)
+
+    if non_usdc_or_aggregator:
         escrow_verified = False
         escrow_provider = None
     elif explicit_escrow_flag is not None:
         escrow_verified = bool(explicit_escrow_flag) and not has_promise_to_pay and reward_usdc > 0
     else:
         escrow_verified = (
-            bool(escrow_provider)
+            (bool(escrow_provider) or has_verified_marker)
             and reward_usdc > 0
             and not has_promise_to_pay
         )
+        if escrow_verified and not escrow_provider:
+            escrow_provider = "verified-escrow"
 
     bounty_id = str(
         issue_data.get("bounty_id")
@@ -433,7 +629,7 @@ class OnChainTaskBoardAdapter(BountyBoardAdapter):
             items = payload.get("bounties", payload if isinstance(payload, list) else [])
             results: list[BountyOpportunity] = []
             for item in items:
-                if not isinstance(item, dict):
+                if not isinstance(item, dict) or is_aggregator_or_digest_issue(item):
                     continue
                 item_copy = dict(item)
                 item_copy.setdefault("platform", "onchain")
@@ -529,8 +725,10 @@ class AlgoraBountyPoller(BountyBoardAdapter):
         else:
             escrow_verified = bool(escrow_flag) and reward_usdc > 0
 
-        if _PROMISE_TO_PAY_RE.search(f"{title}\n{body}") or is_non_usdc_ledger_bounty(
-            title, body, labels, repo_owner=repo_owner
+        if (
+            _PROMISE_TO_PAY_RE.search(f"{title}\n{body}")
+            or is_non_usdc_ledger_bounty(title, body, labels, repo_owner=repo_owner)
+            or is_aggregator_or_digest_issue(item)
         ):
             escrow_verified = False
 
@@ -578,7 +776,7 @@ class AlgoraBountyPoller(BountyBoardAdapter):
             )
             results: list[BountyOpportunity] = []
             for item in items:
-                if not isinstance(item, dict):
+                if not isinstance(item, dict) or is_aggregator_or_digest_issue(item):
                     continue
                 bounty = self.normalize_algora_item(item)
                 if not is_non_usdc_ledger_bounty(
@@ -595,13 +793,16 @@ class AlgoraBountyPoller(BountyBoardAdapter):
 
 
 class GitHubEscrowBountyPoller(BountyBoardAdapter):
-    """Async poller for GitHub issues with verified USD/USDC escrow labels (💎 / bounty), excluding non-USDC tokens."""
+    """Async poller for GitHub issues with verified USD/USDC escrow labels (💎 / bounty), excluding non-USDC tokens & bots."""
 
     def __init__(
         self,
         settings: Settings | None = None,
         http_client: httpx.AsyncClient | None = None,
-        search_query: str = 'is:issue is:open label:bounty ("USDC" OR "💎" OR "/bounty" OR "algora") python -MRG -MergeOS',
+        search_query: str = (
+            'is:issue is:open label:bounty ("USDC" OR "💎" OR "/bounty" OR "algora" OR "opire") '
+            'python -MRG -MergeOS -label:bounty-alert -author:app/github-actions'
+        ),
     ) -> None:
         self.settings = settings or get_settings()
         self._client = http_client
@@ -622,7 +823,7 @@ class GitHubEscrowBountyPoller(BountyBoardAdapter):
         return headers
 
     async def fetch_open_bounties(self) -> list[BountyOpportunity]:
-        """Search GitHub REST API for open bounty issues, skipping non-USDC ledger tokens (like MRG)."""
+        """Search GitHub REST API for open bounty issues, skipping aggregators and non-USDC ledger tokens."""
         url = f"{self.settings.GITHUB_API_URL.rstrip('/')}/search/issues"
         close_client = self._client is None
         client = self._client or httpx.AsyncClient(timeout=15.0, follow_redirects=True)
@@ -638,6 +839,9 @@ class GitHubEscrowBountyPoller(BountyBoardAdapter):
             results: list[BountyOpportunity] = []
             for item in items:
                 if not isinstance(item, dict) or "pull_request" in item:
+                    continue
+                if is_aggregator_or_digest_issue(item):
+                    logger.debug("Skipping aggregator/digest issue from user or label.")
                     continue
                 bounty = normalize_github_issue(item)
                 if is_non_usdc_ledger_bounty(
@@ -656,11 +860,11 @@ class GitHubEscrowBountyPoller(BountyBoardAdapter):
 
 
 class BaseUSDCBountyPoller(BountyBoardAdapter):
-    """Crypto-native poller specifically targeting Base USDC and on-chain USDC escrowed GitHub bounties."""
+    """Crypto-native poller specifically targeting Base USDC and verified escrow bot signatures on GitHub."""
 
     DEFAULT_QUERIES: tuple[str, ...] = (
-        'is:issue is:open "USDC" ("Base" OR "escrow" OR "bounty" OR "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913") python -MRG -MergeOS',
-        'is:issue is:open ("💎" OR "/bounty") "python" ("USDC" OR "$") -MRG -MergeOS',
+        'is:issue is:open "USDC" ("Base" OR "escrow" OR "bounty" OR "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913") python -MRG -MergeOS -label:bounty-alert -author:app/github-actions',
+        'is:issue is:open ("algora-pbc" OR "opire-bot" OR "💎" OR "/bounty") "python" ("USDC" OR "$") -MRG -MergeOS -label:bounty-alert -author:app/github-actions',
     )
 
     def __init__(
@@ -700,6 +904,8 @@ class BaseUSDCBountyPoller(BountyBoardAdapter):
                     payload = response.json()
                     for item in payload.get("items", []):
                         if not isinstance(item, dict) or "pull_request" in item:
+                            continue
+                        if is_aggregator_or_digest_issue(item):
                             continue
                         bounty = normalize_github_issue(item)
                         if is_non_usdc_ledger_bounty(
@@ -745,7 +951,11 @@ def generate_mock_escrowed_bounty() -> BountyOpportunity:
         escrow_verified=True,
         escrow_provider="algora",
         tech_tags=["bug", "fastapi", "pytest", "python"],
-        raw_metadata={"mock": True, "escrow_contract": "algora_verified_v2"},
+        raw_metadata={
+            "mock": True,
+            "escrow_contract": "algora_verified_v2",
+            "escrow_bot": "algora-pbc[bot]",
+        },
     )
 
 
@@ -759,8 +969,10 @@ class BountyScanner:
         seen_cache: SeenBountiesCache | None = None,
         seen_cache_path: str | Path | None = DEFAULT_SEEN_CACHE_PATH,
         seen_ttl_seconds: int = DEFAULT_SEEN_CACHE_TTL_SECONDS,
+        max_candidates_per_cycle: int = MAX_CANDIDATES_PER_CYCLE,
     ) -> None:
         self.settings = settings or get_settings()
+        self.max_candidates_per_cycle = int(max_candidates_per_cycle)
         self.seen_cache = seen_cache or SeenBountiesCache(
             cache_path=seen_cache_path if adapters is None else None,
             ttl_seconds=seen_ttl_seconds,
@@ -792,7 +1004,7 @@ class BountyScanner:
         verified_only: bool = False,
         skip_seen: bool = True,
     ) -> list[BountyOpportunity]:
-        """Concurrently poll all configured bounty adapters, pre-filter non-USDC tokens, and skip seen bounties."""
+        """Concurrently poll all configured bounty adapters, pre-filter non-USDC & aggregator issues, and skip seen bounties."""
         tasks = [adapter.fetch_open_bounties() for adapter in self.adapters]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -802,6 +1014,8 @@ class BountyScanner:
                 logger.warning("Bounty adapter raised exception during scan: %s", res)
                 continue
             for bounty in res:
+                if is_aggregator_or_digest_issue(bounty):
+                    continue
                 if is_non_usdc_ledger_bounty(
                     bounty.title,
                     bounty.body,
@@ -812,12 +1026,103 @@ class BountyScanner:
                 if skip_seen and self.seen_cache.is_seen(bounty.bounty_id):
                     logger.debug("Skipping recently seen bounty (24h cache): %s", bounty.bounty_id)
                     continue
-                if verified_only and not bounty.escrow_verified:
+                if verified_only and not (
+                    bounty.escrow_verified and has_verified_escrow_signature_or_marker(bounty)
+                ):
                     continue
                 if bounty.bounty_id not in deduped:
                     deduped[bounty.bounty_id] = bounty
 
-        return list(deduped.values())
+        ordered = list(deduped.values())
+        ordered.sort(
+            key=lambda b: (
+                has_verified_escrow_signature_or_marker(b),
+                b.escrow_verified,
+                b.reward_usdc,
+            ),
+            reverse=True,
+        )
+        return ordered
+
+    async def poll_verified_batch_until_approved(
+        self,
+        triage_evaluator: Any,
+        max_candidates: int | None = None,
+    ) -> tuple[BountyOpportunity | None, Any | None, list[dict[str, Any]]]:
+        """Iterate through up to 15 unseen candidate issues per poll cycle, pre-filtering for verified escrow bot
+        signatures/USDC markers and caching every rejected bounty_id in seen_bounties until one is approved.
+        """
+        limit = int(max_candidates or self.max_candidates_per_cycle)
+        unseen_candidates = await self.scan_all(verified_only=False, skip_seen=True)
+        batch = unseen_candidates[:limit]
+
+        evaluated_log: list[dict[str, Any]] = []
+        for candidate in batch:
+            # Direct pre-filter for verified escrow bot signatures or explicit USDC/Base escrow markers
+            if not (candidate.escrow_verified and has_verified_escrow_signature_or_marker(candidate)):
+                self.mark_seen(candidate.bounty_id, status="rejected_unverified_escrow_marker")
+                evaluated_log.append(
+                    {
+                        "bounty_id": candidate.bounty_id,
+                        "status": "rejected_unverified_escrow_marker",
+                        "escrow_verified": False,
+                        "security_rejected": False,
+                        "reason": (
+                            "Rejected before triage: missing verified escrow bot signature "
+                            "(e.g., algora-pbc[bot], opire-bot[bot]) or explicit USDC/Base escrow marker."
+                        ),
+                        "bounty": candidate,
+                        "triage": None,
+                    }
+                )
+                continue
+
+            triage_result = await triage_evaluator.evaluate_bounty(candidate)
+            if triage_result.security_rejected:
+                self.mark_seen(candidate.bounty_id, status="security_rejected")
+                evaluated_log.append(
+                    {
+                        "bounty_id": candidate.bounty_id,
+                        "status": "security_rejected",
+                        "escrow_verified": triage_result.escrow_verified,
+                        "security_rejected": True,
+                        "reason": "; ".join(triage_result.security_reasons),
+                        "bounty": candidate,
+                        "triage": triage_result,
+                    }
+                )
+                continue
+
+            if not triage_result.approved:
+                self.mark_seen(candidate.bounty_id, status="rejected")
+                evaluated_log.append(
+                    {
+                        "bounty_id": candidate.bounty_id,
+                        "status": "rejected",
+                        "escrow_verified": triage_result.escrow_verified,
+                        "security_rejected": False,
+                        "reason": triage_result.rationale,
+                        "bounty": candidate,
+                        "triage": triage_result,
+                    }
+                )
+                continue
+
+            # Approved escrowed bounty found!
+            evaluated_log.append(
+                {
+                    "bounty_id": candidate.bounty_id,
+                    "status": "approved",
+                    "escrow_verified": True,
+                    "security_rejected": False,
+                    "reason": triage_result.rationale,
+                    "bounty": candidate,
+                    "triage": triage_result,
+                }
+            )
+            return candidate, triage_result, evaluated_log
+
+        return None, None, evaluated_log
 
     @staticmethod
     def generate_mock_escrowed_bounty() -> BountyOpportunity:

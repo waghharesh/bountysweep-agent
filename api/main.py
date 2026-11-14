@@ -177,12 +177,50 @@ class BountySweepOrchestrator:
                 "detail": "BountySweep Agent is currently paused via kill-switch.",
             }
 
-        # Step 1: Discovery
+        # Step 1 & 2: Discovery, Escrow Marker Pre-Filter & AI Triage (up to 15 unseen candidates per cycle)
         if req.use_mock_bounty:
             bounty = self._resolve_mock_bounty(req.mock_bounty_override)
+            triage_result = await self.triage_engine.evaluate_bounty(bounty)
+            if triage_result.security_rejected:
+                await self.telegram_bot.alert_security_rejection(
+                    bounty_id=bounty.bounty_id,
+                    reasons=triage_result.security_reasons,
+                    stage="triage",
+                )
+                result = {
+                    "status": "security_rejected",
+                    "stage": "triage",
+                    "security_rejected": True,
+                    "security_reasons": triage_result.security_reasons,
+                    "bounty": bounty.model_dump(),
+                    "triage": triage_result.model_dump(),
+                }
+                self.cycle_history.append(result)
+                return result
+
+            if not triage_result.approved:
+                if not triage_result.escrow_verified:
+                    await self.telegram_bot.alert_security_rejection(
+                        bounty_id=bounty.bounty_id,
+                        reasons=[triage_result.rationale],
+                        stage="escrow_verification",
+                    )
+                result = {
+                    "status": "rejected",
+                    "stage": "triage",
+                    "security_rejected": False,
+                    "bounty": bounty.model_dump(),
+                    "triage": triage_result.model_dump(),
+                }
+                self.cycle_history.append(result)
+                return result
         else:
-            discovered = await self.scanner.scan_all(verified_only=False, skip_seen=True)
-            if not discovered:
+            approved_bounty, approved_triage, batch_log = (
+                await self.scanner.poll_verified_batch_until_approved(
+                    triage_evaluator=self.triage_engine,
+                )
+            )
+            if not batch_log:
                 result = {
                     "status": "no_bounties_found",
                     "paused": False,
@@ -190,48 +228,34 @@ class BountySweepOrchestrator:
                 }
                 self.cycle_history.append(result)
                 return result
-            discovered.sort(key=lambda b: (b.escrow_verified, b.reward_usdc), reverse=True)
-            bounty = discovered[0]
 
-        # Step 2: AI Triage & Prompt-Injection / Escrow Screening
-        triage_result = await self.triage_engine.evaluate_bounty(bounty)
-        if triage_result.security_rejected:
-            if not req.use_mock_bounty:
-                self.scanner.mark_seen(bounty.bounty_id, status="security_rejected")
-            await self.telegram_bot.alert_security_rejection(
-                bounty_id=bounty.bounty_id,
-                reasons=triage_result.security_reasons,
-                stage="triage",
-            )
-            result = {
-                "status": "security_rejected",
-                "stage": "triage",
-                "security_rejected": True,
-                "security_reasons": triage_result.security_reasons,
-                "bounty": bounty.model_dump(),
-                "triage": triage_result.model_dump(),
-            }
-            self.cycle_history.append(result)
-            return result
+            for entry in batch_log:
+                if entry["status"] == "security_rejected":
+                    await self.telegram_bot.alert_security_rejection(
+                        bounty_id=entry["bounty_id"],
+                        reasons=[entry["reason"]],
+                        stage="triage",
+                    )
 
-        if not triage_result.approved:
-            if not req.use_mock_bounty:
-                self.scanner.mark_seen(bounty.bounty_id, status="rejected")
-            if not triage_result.escrow_verified:
-                await self.telegram_bot.alert_security_rejection(
-                    bounty_id=bounty.bounty_id,
-                    reasons=[triage_result.rationale],
-                    stage="escrow_verification",
-                )
-            result = {
-                "status": "rejected",
-                "stage": "triage",
-                "security_rejected": False,
-                "bounty": bounty.model_dump(),
-                "triage": triage_result.model_dump(),
-            }
-            self.cycle_history.append(result)
-            return result
+            if approved_bounty is None or approved_triage is None:
+                last_entry = batch_log[-1]
+                last_bounty: BountyOpportunity = last_entry["bounty"]
+                last_triage = last_entry["triage"]
+                result = {
+                    "status": "security_rejected" if last_entry["security_rejected"] else "rejected",
+                    "stage": "triage_batch",
+                    "security_rejected": bool(last_entry["security_rejected"]),
+                    "candidates_evaluated": len(batch_log),
+                    "rejected_bounty_ids": [e["bounty_id"] for e in batch_log],
+                    "bounty": last_bounty.model_dump(),
+                    "triage": last_triage.model_dump() if last_triage is not None else None,
+                    "detail": last_entry["reason"],
+                }
+                self.cycle_history.append(result)
+                return result
+
+            bounty = approved_bounty
+            triage_result = approved_triage
 
         # Step 3: Claim Bounty with Worker Hot Wallet & Send [Bounty Claimed] Alert
         wallet_router = self._get_wallet_router()
