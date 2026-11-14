@@ -77,6 +77,12 @@ async def test_github_poller_and_normalizer_distinguish_verified_vs_promise_to_p
                 "html_url": "https://github.com/data-org/scraper/issues/101",
                 "repository_url": "https://api.github.com/repos/data-org/scraper",
                 "labels": [{"name": "💎 $180"}, {"name": "python"}],
+                "comments_list": [
+                    {
+                        "user": {"login": "algora-pbc[bot]"},
+                        "body": "💎 $180.00 bounty confirmed in escrow via Algora.",
+                    }
+                ],
             },
             {
                 "number": 102,
@@ -365,6 +371,12 @@ async def test_non_usdc_ledger_prefilter_skips_mrg_and_allows_base_usdc() -> Non
                         "title": "Fix async pagination in Base USDC event indexer (250 USDC)",
                         "body": "Reward: 250 USDC settled on Base via escrow [escrow:base]",
                         "labels": [{"name": "bounty"}, {"name": "python"}],
+                        "comments_list": [
+                            {
+                                "user": {"login": "algora-pbc[bot]"},
+                                "body": "💎 $250 USDC escrowed for this issue.",
+                            }
+                        ],
                     },
                 ]
             },
@@ -383,7 +395,7 @@ async def test_non_usdc_ledger_prefilter_skips_mrg_and_allows_base_usdc() -> Non
     assert results[0].bounty_id == "github:base-defi/usdc-indexer#88"
     assert results[0].reward_usdc == 250.0
     assert results[0].escrow_verified is True
-    assert results[0].escrow_provider == "base-usdc"
+    assert results[0].escrow_provider == "algora"
 
 
 @pytest.mark.asyncio
@@ -641,3 +653,89 @@ async def test_three_query_discovery_funnel_comment_escrow_and_raw_candidates_fe
         status_out = orchestrator.get_status()
         assert status_out["last_cycle"] is not None
         assert status_out["last_cycle"]["raw_candidates_fetched"] == 2
+
+
+@pytest.mark.asyncio
+async def test_strict_bot_authored_escrow_and_cross_repo_mirror_rejection() -> None:
+    """Verify strict bot-authored comment escrow requirement and rejection of cross-repo mirror/relay issues."""
+    from evaluator.triage import (
+        is_cross_repo_mirror_or_relay_issue,
+        verify_strict_bot_or_onchain_escrow,
+    )
+
+    engine = BountyTriageEngine(settings=Settings(DRY_RUN_MODE=True, MIN_TRIAGE_SCORE=70))
+
+    # 1. Spoofed 'Held in escrow' and algora/opire links in issue body WITHOUT a bot comment -> REJECTED
+    spoofed_body_issue = normalize_github_issue(
+        {
+            "number": 401,
+            "repo_owner": "relay-org",
+            "repo_name": "bounty-mirror",
+            "title": "[Bounty $200 USDC] Fix Python async bug",
+            "body": (
+                "Reward: $200 USDC Held in escrow via https://console.algora.io/bounties/401 "
+                "and https://app.opire.dev/issues/401 [escrow:verified]\n"
+                "Fix the bug in parser.py and add pytest tests."
+            ),
+            "user": {"login": "regular-human-user"},
+            "comments_list": [
+                {"user": {"login": "another-human"}, "body": "Held in escrow at https://algora.io/123"}
+            ],
+            "labels": ["💎 $200", "bounty", "python"],
+        }
+    )
+    assert spoofed_body_issue.escrow_verified is False
+
+    # Even if a caller forces escrow_verified=True on the model, BountyTriageEngine must still reject it!
+    forced_spoof = spoofed_body_issue.model_copy(update={"escrow_verified": True, "reward_usdc": 200.0})
+    ok_escrow, _ = verify_strict_bot_or_onchain_escrow(forced_spoof)
+    assert ok_escrow is False
+    triage_spoof = await engine.evaluate_bounty(forced_spoof)
+    assert triage_spoof.escrow_verified is False
+    assert triage_spoof.approved is False
+    assert triage_spoof.total_score == 0
+
+    # 2. Cross-repo mirror issue instructing to clone a different repo than repo_url -> REJECTED
+    cross_repo_clone_bounty = BountyOpportunity(
+        bounty_id="github:mirror-tracker/bounties#12",
+        platform="github",
+        repo_owner="mirror-tracker",
+        repo_name="bounties",
+        repo_url="https://github.com/mirror-tracker/bounties",
+        issue_number=12,
+        issue_url="https://github.com/mirror-tracker/bounties/issues/12",
+        title="Fix FastAPI JSON serializer bug ($180 USDC)",
+        body=(
+            "To solve this issue:\n"
+            "1. Run `git clone https://github.com/real-upstream/actual-service.git`\n"
+            "2. Fix the bug and add pytest tests."
+        ),
+        labels=["python", "fastapi", "bug"],
+        reward_usdc=180.0,
+        escrow_verified=True,
+        escrow_provider="algora",
+        raw_metadata={
+            "comments_list": [
+                {"user": {"login": "algora-pbc[bot]"}, "body": "💎 $180.00 bounty escrowed."}
+            ]
+        },
+    )
+    is_mirror, mirror_msg = is_cross_repo_mirror_or_relay_issue(cross_repo_clone_bounty)
+    assert is_mirror is True
+    assert "real-upstream/actual-service" in mirror_msg
+    triage_mirror = await engine.evaluate_bounty(cross_repo_clone_bounty)
+    assert triage_mirror.approved is False
+    assert triage_mirror.total_score == 0
+    assert "Cross-repo mirror/relay" in triage_mirror.rationale
+
+    # 3. Issue stating PRs are not reviewed on this repo -> REJECTED
+    no_pr_review_bounty = cross_repo_clone_bounty.model_copy(
+        update={
+            "body": "Fix the Python parser bug. Note: PRs are not reviewed on this repo; submit upstream.",
+        }
+    )
+    is_mirror_pr, _ = is_cross_repo_mirror_or_relay_issue(no_pr_review_bounty)
+    assert is_mirror_pr is True
+    triage_no_pr = await engine.evaluate_bounty(no_pr_review_bounty)
+    assert triage_no_pr.approved is False
+    assert triage_no_pr.total_score == 0

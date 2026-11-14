@@ -280,3 +280,69 @@ def test_dry_run_e2e_workspace_execution_with_real_pytest(
     assert report.container_config_audit["mem_limit"] == "1g"
     assert report.container_config_audit["cpu_quota"] == 100_000
     assert report.container_config_audit["read_only"] is True
+
+
+def test_pytest_exit_code_5_falls_back_to_unittest_or_safe_local_script(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When pytest exits with code 5 (no tests collected), sandbox must fall back to unittest discover or safe repo script."""
+    monkeypatch.setattr(
+        "sandbox.runner.docker.from_env",
+        MagicMock(side_effect=DockerException("Docker socket unavailable in test VM")),
+    )
+
+    # Create a repo where tests are in a custom script mentioned in README.md (not named test_*.py so pytest exits 5)
+    (tmp_path / "README.md").write_text(
+        "# Sample Repo\nRun validation via:\n```bash\npython custom_check_suite.py\n```\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "math_mod.py").write_text(
+        "def clamp_positive(val: int) -> int:\n    return val\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "custom_check_suite.py").write_text(
+        "import unittest\n"
+        "from math_mod import clamp_positive\n\n"
+        "class MathCheck(unittest.TestCase):\n"
+        "    def test_positive(self) -> None:\n"
+        "        self.assertEqual(clamp_positive(5), 5)\n\n"
+        "if __name__ == '__main__':\n"
+        "    unittest.main()\n",
+        encoding="utf-8",
+    )
+
+    discovered = DockerSandboxRunner.discover_safe_local_test_scripts(tmp_path)
+    assert ["python", "custom_check_suite.py"] in discovered
+
+    runner = DockerSandboxRunner(
+        settings=Settings(DRY_RUN_MODE=True, SANDBOX_TIMEOUT_SECONDS=60),
+        allow_local_fallback=True,
+    )
+    report = runner.verify_bounty_patch(
+        bounty_id="bounty-fallback-runner",
+        repo_url="https://github.com/example/custom-runner-repo",
+        file_patches={
+            "math_mod.py": (
+                "def clamp_positive(val: int) -> int:\n"
+                "    return max(0, val)\n"
+            )
+        },
+        regression_tests={
+            "tests/test_clamp_regression.py": (
+                "from math_mod import clamp_positive\n\n"
+                "def test_negative_clamped_to_zero() -> None:\n"
+                "    assert clamp_positive(-10) == 0\n"
+            )
+        },
+        workspace_dir=tmp_path,
+        cleanup_workspace=False,
+    )
+
+    assert report.baseline_run.passed is True
+    assert report.baseline_run.passed_count == 1
+    assert report.patched_run.passed is True
+    assert report.patched_run.passed_count >= 2
+    assert report.all_existing_tests_passed is True
+    assert report.new_regression_test_passed is True
+    assert report.submission_approved is True

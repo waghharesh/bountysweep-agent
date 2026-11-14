@@ -25,11 +25,19 @@ logger = logging.getLogger(__name__)
 _PASSED_RE = re.compile(r"(\d+)\s+passed")
 _FAILED_RE = re.compile(r"(\d+)\s+failed")
 _ERROR_RE = re.compile(r"(\d+)\s+errors?")
+_UNITTEST_RAN_RE = re.compile(r"Ran\s+(\d+)\s+tests?\s+in\s+[0-9.]+s", re.IGNORECASE)
+_UNITTEST_FAILURES_RE = re.compile(r"failures=(\d+)", re.IGNORECASE)
+_UNITTEST_ERRORS_RE = re.compile(r"errors=(\d+)", re.IGNORECASE)
+_SAFE_REL_SCRIPT_RE = re.compile(r"^[A-Za-z0-9_./-]+\.py$")
+_DOC_TEST_SCRIPT_RE = re.compile(
+    r"\bpython(?:3)?\s+([A-Za-z0-9_./-]+\.py)\b",
+    re.IGNORECASE,
+)
 _TEST_FUNC_RE = re.compile(r"^\s*(?:async\s+)?def\s+(test_[a-zA-Z0-9_]+)\s*\(", re.MULTILINE)
 
 
 class SandboxTestRunResult(BaseModel):
-    """Structured result of a single isolated pytest execution inside the sandbox."""
+    """Structured result of a single isolated test execution inside the sandbox."""
 
     passed: bool
     exit_code: int
@@ -68,9 +76,11 @@ class DockerSandboxRunner:
     - Only `/workspace` volume mounted read-write (`rw`), plus bounded `/tmp` tmpfs with `noexec`.
     - All Linux capabilities dropped (`cap_drop=["ALL"]`) and `no-new-privileges:true`.
     - Hard 120-second execution timeout with guaranteed container removal.
+    - Automatic fallback to `python -m unittest discover` or safe local test scripts if `pytest` exits with code 5.
     """
 
     DEFAULT_PYTEST_COMMAND: list[str] = ["pytest", "-q", "--tb=short"]
+    UNITTEST_DISCOVER_COMMAND: list[str] = ["python", "-m", "unittest", "discover", "-v"]
 
     def __init__(
         self,
@@ -81,6 +91,7 @@ class DockerSandboxRunner:
         self.settings: Settings = settings or get_settings()
         self._docker_client: Any | None = docker_client
         self.allow_local_fallback: bool = allow_local_fallback
+        self._last_fallback_command: list[str] | None = None
 
     def _get_docker_client(self) -> Any:
         """Lazily initialize or return injected Docker client."""
@@ -249,14 +260,81 @@ class DockerSandboxRunner:
         return workspace
 
     @staticmethod
+    def discover_safe_local_test_scripts(workspace_dir: str | Path) -> list[list[str]]:
+        """Discover safe local Python test scripts in workspace_dir or mentioned in repo docs."""
+        workspace = Path(workspace_dir).resolve()
+        if not workspace.exists():
+            return []
+
+        candidates: list[str] = []
+
+        # 1. Check scripts mentioned in README / Makefile / pyproject.toml
+        for doc_name in ("README.md", "README.rst", "README.txt", "Makefile", "pyproject.toml"):
+            doc_path = workspace / doc_name
+            if doc_path.exists() and doc_path.is_file():
+                try:
+                    content = doc_path.read_text(encoding="utf-8", errors="ignore")
+                    for match in _DOC_TEST_SCRIPT_RE.finditer(content):
+                        candidates.append(match.group(1).strip())
+                except OSError:
+                    pass
+
+        # 2. Check standard local test script filenames
+        for std_rel in (
+            "run_tests.py",
+            "test.py",
+            "tests.py",
+            "check_tests.py",
+            "scripts/run_tests.py",
+            "scripts/test.py",
+        ):
+            candidates.append(std_rel)
+
+        # 3. Check top-level *test*.py files
+        try:
+            for child in sorted(workspace.glob("*test*.py")):
+                if child.is_file():
+                    candidates.append(child.name)
+        except OSError:
+            pass
+
+        seen: set[str] = set()
+        commands: list[list[str]] = []
+        for rel in candidates:
+            cleaned = rel.lstrip("./")
+            if not cleaned or cleaned in seen:
+                continue
+            if ".." in cleaned.split("/") or cleaned.startswith("-") or not _SAFE_REL_SCRIPT_RE.match(cleaned):
+                continue
+            resolved = (workspace / cleaned).resolve()
+            if resolved != workspace and workspace in resolved.parents and resolved.is_file():
+                seen.add(cleaned)
+                commands.append(["python", cleaned])
+
+        return commands
+
+    @classmethod
+    def get_fallback_test_commands(cls, workspace_dir: str | Path) -> list[list[str]]:
+        """Return ordered fallback test runner commands when pytest exits with code 5 (no tests collected)."""
+        workspace = Path(workspace_dir).resolve()
+        commands: list[list[str]] = [list(cls.UNITTEST_DISCOVER_COMMAND)]
+        if (workspace / "tests").is_dir():
+            commands.append(["python", "-m", "unittest", "discover", "-s", "tests", "-p", "*test*.py", "-v"])
+        elif (workspace / "test").is_dir():
+            commands.append(["python", "-m", "unittest", "discover", "-s", "test", "-p", "*test*.py", "-v"])
+        commands.extend(cls.discover_safe_local_test_scripts(workspace))
+        return commands
+
+    @staticmethod
     def parse_pytest_output(
         stdout: str,
         stderr: str = "",
         exit_code: int = 0,
         timed_out: bool = False,
         duration_seconds: float = 0.0,
+        is_fallback_script: bool = False,
     ) -> SandboxTestRunResult:
-        """Parse pytest summary output into a `SandboxTestRunResult`."""
+        """Parse pytest, unittest, or fallback script output into a `SandboxTestRunResult`."""
         combined = f"{stdout}\n{stderr}"
         passed_matches = _PASSED_RE.findall(combined)
         failed_matches = _FAILED_RE.findall(combined)
@@ -265,8 +343,24 @@ class DockerSandboxRunner:
         passed_count = int(passed_matches[-1]) if passed_matches else 0
         failed_count = int(failed_matches[-1]) if failed_matches else 0
         error_count = int(error_matches[-1]) if error_matches else 0
-
         effective_failed = failed_count + error_count
+
+        # Parse unittest output ('Ran N tests in X.XXXs') if pytest counters did not match
+        if passed_count == 0 and effective_failed == 0:
+            unittest_ran = _UNITTEST_RAN_RE.findall(combined)
+            if unittest_ran:
+                ran_count = int(unittest_ran[-1])
+                u_fail = _UNITTEST_FAILURES_RE.findall(combined)
+                u_err = _UNITTEST_ERRORS_RE.findall(combined)
+                effective_failed = (int(u_fail[-1]) if u_fail else 0) + (int(u_err[-1]) if u_err else 0)
+                if exit_code != 0 and effective_failed == 0 and ran_count > 0:
+                    effective_failed = 1
+                passed_count = max(0, ran_count - effective_failed)
+            elif is_fallback_script and not timed_out and exit_code == 0:
+                lower_out = combined.lower()
+                if "ran 0 tests" not in lower_out and "no tests ran" not in lower_out:
+                    passed_count = 1
+
         total_count = passed_count + effective_failed
 
         passed = (
@@ -292,8 +386,9 @@ class DockerSandboxRunner:
         self,
         workspace_dir: Path,
         command: list[str] | str | None = None,
+        is_fallback_script: bool = False,
     ) -> SandboxTestRunResult:
-        """Fallback local pytest execution used only in dry-run mode when Docker is unavailable."""
+        """Fallback local test execution used in dry-run mode when Docker is unavailable."""
         start = time.monotonic()
         if isinstance(command, str):
             args = command.split()
@@ -304,6 +399,8 @@ class DockerSandboxRunner:
 
         if args[0] == "pytest":
             cmd = [sys.executable, "-m", "pytest", *args[1:]]
+        elif args[0] in ("python", "python3"):
+            cmd = [sys.executable, *args[1:]]
         else:
             cmd = args
 
@@ -331,6 +428,7 @@ class DockerSandboxRunner:
                 exit_code=proc.returncode,
                 timed_out=False,
                 duration_seconds=duration,
+                is_fallback_script=is_fallback_script,
             )
         except subprocess.TimeoutExpired as exc:
             duration = time.monotonic() - start
@@ -350,15 +448,16 @@ class DockerSandboxRunner:
                 exit_code=124,
                 timed_out=True,
                 duration_seconds=duration,
+                is_fallback_script=is_fallback_script,
             )
 
-    def run_pytest_in_container(
+    def _run_single_command_in_container(
         self,
-        workspace_dir: str | Path,
+        workspace_path: Path,
         command: list[str] | str | None = None,
+        is_fallback_script: bool = False,
     ) -> tuple[SandboxTestRunResult, dict[str, Any]]:
-        """Run pytest inside an ephemeral isolated container and return result + config audit."""
-        workspace_path = Path(workspace_dir).resolve()
+        """Execute a single test command inside the isolated container (or local fallback)."""
         container_kwargs = self._build_container_kwargs(workspace_path, command=command)
         start = time.monotonic()
 
@@ -367,9 +466,13 @@ class DockerSandboxRunner:
         except DockerException:
             if self.allow_local_fallback and self._docker_client is None:
                 logger.info(
-                    "Docker daemon socket unavailable on host; using isolated local pytest fallback."
+                    "Docker daemon socket unavailable on host; using isolated local test fallback."
                 )
-                result = self._run_local_fallback_pytest(workspace_path, command=command)
+                result = self._run_local_fallback_pytest(
+                    workspace_path,
+                    command=command,
+                    is_fallback_script=is_fallback_script,
+                )
                 return result, container_kwargs
             raise
 
@@ -379,9 +482,13 @@ class DockerSandboxRunner:
         except DockerException:
             if self.allow_local_fallback and self._docker_client is None:
                 logger.info(
-                    "Docker container launch unavailable on host; using local pytest fallback."
+                    "Docker container launch unavailable on host; using local test fallback."
                 )
-                result = self._run_local_fallback_pytest(workspace_path, command=command)
+                result = self._run_local_fallback_pytest(
+                    workspace_path,
+                    command=command,
+                    is_fallback_script=is_fallback_script,
+                )
                 return result, container_kwargs
             raise
 
@@ -428,7 +535,46 @@ class DockerSandboxRunner:
             exit_code=exit_code,
             timed_out=timed_out,
             duration_seconds=duration,
+            is_fallback_script=is_fallback_script,
         )
+        return result, container_kwargs
+
+    def run_pytest_in_container(
+        self,
+        workspace_dir: str | Path,
+        command: list[str] | str | None = None,
+    ) -> tuple[SandboxTestRunResult, dict[str, Any]]:
+        """Run pytest inside an ephemeral isolated container; if pytest exits with code 5 (no tests collected),
+        automatically fall back to `python -m unittest discover` or a safe local test script in the repo.
+        """
+        workspace_path = Path(workspace_dir).resolve()
+        self._last_fallback_command = None
+        result, container_kwargs = self._run_single_command_in_container(
+            workspace_path,
+            command=command,
+            is_fallback_script=False,
+        )
+
+        # If a custom command was explicitly requested or pytest did not exit with code 5, return immediately
+        if command is not None or result.exit_code != 5:
+            return result, container_kwargs
+
+        logger.info(
+            "pytest exited with code 5 (no tests collected) in %s; attempting fallback test runners.",
+            workspace_path,
+        )
+        fallback_commands = self.get_fallback_test_commands(workspace_path)
+        for fb_cmd in fallback_commands:
+            is_script = fb_cmd[:3] != ["python", "-m", "unittest"]
+            fb_result, fb_kwargs = self._run_single_command_in_container(
+                workspace_path,
+                command=fb_cmd,
+                is_fallback_script=is_script,
+            )
+            if fb_result.passed or fb_result.total_count > 0:
+                self._last_fallback_command = fb_cmd
+                return fb_result, fb_kwargs
+
         return result, container_kwargs
 
     @staticmethod
@@ -562,6 +708,7 @@ class DockerSandboxRunner:
                 workspace_path,
                 command=pytest_command,
             )
+            baseline_fallback_cmd = self._last_fallback_command
 
             regression_tests_added = self.apply_patch_and_tests(
                 workspace_dir=workspace_path,
@@ -573,6 +720,39 @@ class DockerSandboxRunner:
                 workspace_path,
                 command=pytest_command,
             )
+
+            # If baseline used a fallback test runner (e.g., unittest or a safe local test script)
+            # and pytest on the patched repo only collected the newly added pytest regression test(s),
+            # also run the baseline fallback command to verify all existing tests still pass.
+            if (
+                pytest_command is None
+                and baseline_fallback_cmd is not None
+                and patched_run.passed
+                and patched_run.passed_count < baseline_run.passed_count + regression_tests_added
+            ):
+                is_script = baseline_fallback_cmd[:3] != ["python", "-m", "unittest"]
+                fb_patched, _ = self._run_single_command_in_container(
+                    workspace_path,
+                    command=baseline_fallback_cmd,
+                    is_fallback_script=is_script,
+                )
+                if fb_patched.passed and fb_patched.failed_count == 0:
+                    combined_passed = fb_patched.passed_count + patched_run.passed_count
+                    patched_run = SandboxTestRunResult(
+                        passed=True,
+                        exit_code=0,
+                        passed_count=combined_passed,
+                        failed_count=0,
+                        total_count=combined_passed,
+                        stdout=f"{fb_patched.stdout}\n{patched_run.stdout}".strip(),
+                        stderr=f"{fb_patched.stderr}\n{patched_run.stderr}".strip(),
+                        timed_out=False,
+                        duration_seconds=round(
+                            fb_patched.duration_seconds + patched_run.duration_seconds, 4
+                        ),
+                    )
+                elif not fb_patched.passed:
+                    patched_run = fb_patched
 
             (
                 all_existing_passed,

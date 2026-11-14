@@ -31,14 +31,8 @@ THREE_QUERY_DISCOVERY_FUNNEL: tuple[str, str, str] = (
 VERIFIED_ESCROW_BOT_LOGINS: frozenset[str] = frozenset(
     {
         "algora-pbc[bot]",
-        "algora[bot]",
         "opire-bot[bot]",
-        "opire[bot]",
         "polar-sh[bot]",
-        "polar[bot]",
-        "gitcoinbot",
-        "gitcoin[bot]",
-        "bountycaster[bot]",
     }
 )
 
@@ -351,9 +345,10 @@ def _extract_comments_metadata(raw: dict[str, Any]) -> tuple[list[str], list[str
 def has_verified_escrow_signature_or_marker(
     issue_data_or_bounty: dict[str, Any] | BountyOpportunity,
 ) -> bool:
-    """Verify escrow by checking issue comments/authors for official escrow bot confirmations
-    (algora-pbc[bot], opire-bot[bot], polar-sh[bot]) or verified USDC escrow links/markers.
-    Does NOT require the word 'Base' to appear in the issue body.
+    """Strictly verify escrow: never accept links or 'Held in escrow' text in the issue body alone.
+
+    Requires at least one comment in comments_list authored specifically by a verified escrow bot login
+    (algora-pbc[bot], opire-bot[bot], or polar-sh[bot]), or a verified on-chain / Algora escrow API response.
     """
     if isinstance(issue_data_or_bounty, BountyOpportunity):
         bounty = issue_data_or_bounty
@@ -361,10 +356,7 @@ def has_verified_escrow_signature_or_marker(
         labels = bounty.labels
         title = bounty.title
         body = bounty.body
-        if bounty.platform in {"algora", "onchain"} and bounty.escrow_verified and bounty.reward_usdc > 0:
-            return True
-        if bounty.escrow_verified and bounty.escrow_provider and bounty.reward_usdc > 0:
-            return True
+        platform = bounty.platform
     else:
         raw = issue_data_or_bounty
         raw_labels = raw.get("labels") or []
@@ -376,14 +368,26 @@ def has_verified_escrow_signature_or_marker(
         ]
         title = str(raw.get("title") or "")
         body = str(raw.get("body") or "")
-        if bool(raw.get("escrow_verified")) and float(raw.get("reward_usdc") or 0.0) > 0:
-            return True
+        platform = str(raw.get("platform") or "github")
 
     combined_issue = f"{' '.join(labels)}\n{title}\n{body}"
     if _PROMISE_TO_PAY_RE.search(combined_issue):
         return False
 
-    # 1. Check issue author / bot signature
+    # 1. Check issue comments for a comment authored specifically by algora-pbc[bot], opire-bot[bot], or polar-sh[bot]
+    comment_logins, _ = _extract_comments_metadata(raw)
+    for c_login in comment_logins:
+        if c_login in VERIFIED_ESCROW_BOT_LOGINS:
+            return True
+
+    # 2. Check verified on-chain escrow API response or direct Algora API /bounties payload
+    if platform == "onchain" or bool(raw.get("onchain_escrow_verified")) or bool(raw.get("escrow_contract")):
+        return True
+
+    if platform == "algora" and ("id" in raw or "reward_cents" in raw or "status" in raw):
+        return True
+
+    # 3. Check if the issue itself was authored directly by an official escrow bot or tagged in metadata
     user_obj = raw.get("user") or raw.get("author") or {}
     user_login = (
         str(user_obj.get("login") if isinstance(user_obj, dict) else user_obj or "")
@@ -395,22 +399,6 @@ def has_verified_escrow_signature_or_marker(
 
     escrow_bot = str(raw.get("escrow_bot") or raw.get("bot_signature") or "").strip().lower()
     if escrow_bot in VERIFIED_ESCROW_BOT_LOGINS:
-        return True
-
-    # 2. Check issue comments for official escrow bot confirmations or verified USDC escrow links
-    comment_logins, comment_bodies = _extract_comments_metadata(raw)
-    for c_login in comment_logins:
-        if c_login in VERIFIED_ESCROW_BOT_LOGINS:
-            return True
-    for c_body in comment_bodies:
-        if not _PROMISE_TO_PAY_RE.search(c_body) and _EXPLICIT_USDC_OR_BASE_ESCROW_RE.search(c_body):
-            return True
-
-    # 3. Check labels and issue text for verified USDC escrow links or diamond/bounty markers
-    if any("💎" in lbl and ("$" in lbl or "usdc" in lbl.lower()) for lbl in labels):
-        return True
-
-    if _EXPLICIT_USDC_OR_BASE_ESCROW_RE.search(combined_issue):
         return True
 
     return False
@@ -482,8 +470,9 @@ def parse_reward_usd_from_text(text: str) -> float:
 def normalize_github_issue(issue_data: dict[str, Any]) -> BountyOpportunity:
     """Normalize a GitHub REST or GraphQL issue payload into a BountyOpportunity.
 
-    Verifies escrow via issue comments (algora-pbc[bot], opire-bot[bot], polar-sh[bot]) or verified
-    USDC escrow links without requiring 'Base' in the issue body.
+    Strictly verifies escrow via comments authored by official escrow bots (algora-pbc[bot], opire-bot[bot],
+    polar-sh[bot]) or verified on-chain escrow API responses. Never marks escrow_verified=True based on
+    links or 'Held in escrow' text in the issue body alone.
     """
     raw_labels = issue_data.get("labels", [])
     if isinstance(raw_labels, dict) and "nodes" in raw_labels:
@@ -556,23 +545,21 @@ def normalize_github_issue(issue_data: dict[str, Any]) -> BountyOpportunity:
     elif "reward_cents" in issue_data and issue_data["reward_cents"] is not None:
         reward_usdc = round(float(issue_data["reward_cents"]) / 100.0, 2)
     elif not non_usdc_or_aggregator:
-        for lbl in labels:
-            amt = parse_reward_usd_from_text(lbl)
-            if amt > 0:
-                reward_usdc = amt
-                break
+        if comments_text:
+            reward_usdc = parse_reward_usd_from_text(comments_text)
+        if reward_usdc <= 0:
+            for lbl in labels:
+                amt = parse_reward_usd_from_text(lbl)
+                if amt > 0:
+                    reward_usdc = amt
+                    break
         if reward_usdc <= 0:
             reward_usdc = parse_reward_usd_from_text(f"{title}\n{body}")
-        if reward_usdc <= 0 and comments_text:
-            reward_usdc = parse_reward_usd_from_text(comments_text)
 
     combined_issue_text = f"{' '.join(labels)}\n{title}\n{body}"
-    combined_all_text = f"{combined_issue_text}\n{comments_text}"
     has_promise_to_pay = bool(_PROMISE_TO_PAY_RE.search(combined_issue_text))
 
     escrow_provider: str | None = issue_data.get("escrow_provider")
-    explicit_escrow_flag = issue_data.get("escrow_verified")
-
     user_obj = issue_data.get("user") or issue_data.get("author") or {}
     user_login = (
         str(user_obj.get("login") if isinstance(user_obj, dict) else user_obj or "")
@@ -583,21 +570,12 @@ def normalize_github_issue(issue_data: dict[str, Any]) -> BountyOpportunity:
     all_bot_logins = [user_login, escrow_bot, *comment_logins]
 
     if not escrow_provider:
-        if any("algora" in login for login in all_bot_logins if login):
+        if any(login == "algora-pbc[bot]" for login in all_bot_logins):
             escrow_provider = "algora"
-        elif any("opire" in login for login in all_bot_logins if login):
+        elif any(login == "opire-bot[bot]" for login in all_bot_logins):
             escrow_provider = "opire"
-        elif any("polar" in login for login in all_bot_logins if login):
+        elif any(login == "polar-sh[bot]" for login in all_bot_logins):
             escrow_provider = "polar"
-        else:
-            for provider_name, pattern in _ESCROW_PROVIDER_PATTERNS:
-                if pattern.search(combined_all_text):
-                    escrow_provider = provider_name
-                    break
-
-    has_diamond_amount_label = any("💎" in lbl and ("$" in lbl or "usdc" in lbl.lower()) for lbl in labels)
-    if has_diamond_amount_label and not escrow_provider:
-        escrow_provider = "algora"
 
     has_verified_marker = has_verified_escrow_signature_or_marker(issue_data)
 
@@ -617,16 +595,14 @@ def normalize_github_issue(issue_data: dict[str, Any]) -> BountyOpportunity:
     if non_usdc_or_aggregator:
         escrow_verified = False
         escrow_provider = None
-    elif explicit_escrow_flag is not None:
-        escrow_verified = bool(explicit_escrow_flag) and not has_promise_to_pay and reward_usdc > 0
     else:
         escrow_verified = (
-            (bool(escrow_provider) or has_verified_marker)
+            has_verified_marker
             and reward_usdc > 0
             and not has_promise_to_pay
         )
         if escrow_verified and not escrow_provider:
-            escrow_provider = "verified-escrow"
+            escrow_provider = "onchain-escrow" if str(issue_data.get("platform")) == "onchain" else "verified-escrow"
 
     bounty_id = str(
         issue_data.get("bounty_id")
