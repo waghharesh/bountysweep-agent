@@ -18,6 +18,9 @@ on:
         required: false
         default: "false"
 
+permissions:
+  contents: write
+
 concurrency:
   group: bountysweep-autonomous-runner
   cancel-in-progress: false
@@ -35,6 +38,14 @@ jobs:
         with:
           python-version: "3.12"
           cache: "pip"
+
+      - name: Restore 24h Seen Bounties Cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/bountysweep_seen_bounties.json
+          key: seen-bounties-${{ github.run_id }}
+          restore-keys: |
+            seen-bounties-
 
       - name: Install Dependencies
         run: |
@@ -63,3 +74,13 @@ jobs:
           fi
           LOOPS="${{ github.event.inputs.loops || '1' }}"
           python run_autonomous_cycle.py --loops "$LOOPS" --interval 300 $MOCK_FLAG
+
+      - name: Publish Telemetry to GitHub Pages Dashboard
+        if: always()
+        run: |
+          if [ -f docs/status.json ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add docs/status.json
+            git diff --cached --quiet || (git commit -m "chore(telemetry): update dashboard status.json [skip ci]" && git push origin HEAD:main)
+          fi

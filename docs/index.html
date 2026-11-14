@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BountySweep Agent — GitHub Actions Cloud Mission Control</title>
+  <style>
+    :root {
+      --bg: #0b0f17;
+      --panel: #131b2e;
+      --panel-border: #1e293b;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --green: #10b981;
+      --amber: #f59e0b;
+      --red: #ef4444;
+      --purple: #a855f7;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, monospace;
+      background: var(--bg);
+      color: var(--text);
+      padding: 24px;
+      line-height: 1.5;
+    }
+    .container { max-width: 1240px; margin: 0 auto; }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      padding: 20px 24px;
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      border-radius: 12px;
+      margin-bottom: 24px;
+    }
+    .brand h1 { font-size: 1.35rem; font-weight: 700; display: flex; align-items: center; gap: 10px; }
+    .brand p { color: var(--muted); font-size: 0.85rem; margin-top: 4px; }
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 9px 15px;
+      border-radius: 8px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      text-decoration: none;
+      border: 1px solid var(--panel-border);
+      background: #1e293b;
+      color: var(--text);
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .btn:hover { border-color: var(--accent); color: #fff; }
+    .btn-primary { background: #0284c7; border-color: #0369a1; color: #fff; }
+    .btn-primary:hover { background: #0369a1; }
+    .btn-tg { background: #0088cc; border-color: #0077b5; color: #fff; }
+    .grid-kpi {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      border-radius: 12px;
+      padding: 18px 20px;
+    }
+    .card-label { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+    .card-value { font-size: 1.65rem; font-weight: 700; margin-top: 6px; color: #fff; }
+    .card-sub { font-size: 0.8rem; color: var(--muted); margin-top: 4px; word-break: break-all; }
+    .card-sub a { color: var(--accent); text-decoration: none; }
+    .grid-main {
+      display: grid;
+      grid-template-columns: 1.15fr 0.85fr;
+      gap: 20px;
+      margin-bottom: 24px;
+    }
+    @media (max-width: 920px) { .grid-main { grid-template-columns: 1fr; } }
+    h2 { font-size: 1.05rem; margin-bottom: 14px; display: flex; align-items: center; justify-content: space-between; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+    th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--panel-border); }
+    th { color: var(--muted); font-weight: 600; font-size: 0.76rem; text-transform: uppercase; }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 0.73rem;
+      font-weight: 600;
+    }
+    .b-green { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.35); }
+    .b-amber { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.35); }
+    .b-red { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.35); }
+    .b-blue { background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.35); }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.8rem; }
+    .feed-item {
+      padding: 12px;
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+      background: rgba(15, 23, 42, 0.65);
+      margin-bottom: 10px;
+      font-size: 0.83rem;
+    }
+    .feed-item .meta { display: flex; justify-content: space-between; color: var(--muted); font-size: 0.75rem; margin-bottom: 4px; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="brand">
+        <h1>🛡️ BountySweep Agent — GitHub Actions Mission Control</h1>
+        <p>Autonomous Base USDC Discovery (Batch-15 + Escrow Signature Pre-Filter) • Gemini Triage • Isolated Sandbox • Cold Wallet Sweep</p>
+      </div>
+      <div class="actions">
+        <a class="btn btn-primary" href="https://github.com/waghharesh/bountysweep-agent/actions/workflows/bountysweep.yml" target="_blank" rel="noopener">
+          ⚡ Trigger / View GitHub Action
+        </a>
+        <a class="btn btn-tg" href="https://t.me/Waggy_bounty_hunter_bot" target="_blank" rel="noopener">
+          ✈️ Telegram @Waggy_bounty_hunter_bot
+        </a>
+        <button class="btn" onclick="refreshAll()">🔄 Refresh</button>
+      </div>
+    </header>
+
+    <div class="grid-kpi">
+      <div class="card">
+        <div class="card-label">Cloud Runner Status</div>
+        <div class="card-value" id="kpi-status"><span class="badge b-green">ACTIVE (CRON 30m)</span></div>
+        <div class="card-sub" id="kpi-updated">Loading latest telemetry...</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Owner Cold Wallet (Base USDC)</div>
+        <div class="card-value mono" style="font-size:1.05rem" id="kpi-cold">0x1FCCE3...EeAa70</div>
+        <div class="card-sub">
+          <a id="kpi-cold-link" href="https://basescan.org/address/0x1FCCE38b01BD7127AC6FA7D2Fc38237F69EeAa70" target="_blank" rel="noopener">
+            View on BaseScan ↗
+          </a>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-label">Burner Worker Hot Wallet</div>
+        <div class="card-value mono" style="font-size:1.05rem" id="kpi-worker">0x9AcEBF...FDe852</div>
+        <div class="card-sub">
+          <a id="kpi-worker-link" href="https://basescan.org/address/0x9AcEBFfDa3F9a0F711930c91129074161eFDe852" target="_blank" rel="noopener">
+            View on BaseScan ↗
+          </a>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-label">24h Seen Bounties Cache</div>
+        <div class="card-value" id="kpi-seen">—</div>
+        <div class="card-sub">Rejected/processed IDs skipped for 24h</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Scanned / Approved / Swept</div>
+        <div class="card-value" id="kpi-metrics">0 / 0 / $0</div>
+        <div class="card-sub">Threshold: $5.00 USDC auto-sweep</div>
+      </div>
+    </div>
+
+    <div class="grid-main">
+      <div class="card">
+        <h2>
+          <span>⚙️ Live GitHub Actions Workflow Runs</span>
+          <a href="https://github.com/waghharesh/bountysweep-agent/actions" target="_blank" rel="noopener" style="font-size:0.8rem">All Runs ↗</a>
+        </h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Run</th>
+              <th>Status</th>
+              <th>Trigger</th>
+              <th>Started (UTC)</th>
+              <th>Logs</th>
+            </tr>
+          </thead>
+          <tbody id="runs-tbody">
+            <tr><td colspan="5" style="color:var(--muted)">Fetching live runs from GitHub API...</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>
+          <span>🔍 Latest Batch-15 Triage & Cycle Feed</span>
+          <span class="badge b-blue" id="feed-badge">Live</span>
+        </h2>
+        <div id="cycle-feed">
+          <div class="feed-item">Loading cycle telemetry from <code>status.json</code>...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    async function loadStatusJson() {
+      try {
+        const resp = await fetch('./status.json?t=' + Date.now());
+        if (!resp.ok) return;
+        const data = await resp.json();
+        const m = data.metrics || {};
+        document.getElementById('kpi-seen').textContent = (data.seen_bounties_cached_24h ?? 0) + ' IDs';
+        document.getElementById('kpi-metrics').textContent =
+          `${m.bounties_scanned ?? 0} / ${m.bounties_approved ?? 0} / $${(m.total_swept_usdc ?? 0).toFixed(2)}`;
+        if (data.last_updated_utc) {
+          document.getElementById('kpi-updated').textContent = 'Last telemetry: ' + new Date(data.last_updated_utc).toUTCString();
+        }
+        const feedEl = document.getElementById('cycle-feed');
+        const history = data.cycle_history || data.latest_run_cycles || [];
+        if (history.length > 0) {
+          feedEl.innerHTML = history.slice(0, 8).map(item => {
+            const b = item.bounty || {};
+            const t = item.triage || {};
+            const batch = item.batch_evaluated || [];
+            const outcome = item.outcome || 'evaluated';
+            const badgeClass = outcome === 'completed' ? 'b-green' : (outcome.includes('rejected') ? 'b-amber' : 'b-blue');
+            return `
+              <div class="feed-item">
+                <div class="meta">
+                  <span><span class="badge ${badgeClass}">${outcome}</span> • Batch evaluated: ${batch.length}</span>
+                  <span>${b.value_usdc ? '$' + Number(b.value_usdc).toFixed(2) + ' USDC' : ''}</span>
+                </div>
+                <div style="font-weight:600;margin-top:4px">${b.bounty_id || 'Discovery Poll Cycle'}</div>
+                <div style="color:var(--muted);margin-top:3px">${t.reasoning || item.message || 'Completed verification'}</div>
+              </div>
+            `;
+          }).join('');
+        }
+      } catch (e) {
+        console.warn('Could not load status.json:', e);
+      }
+    }
+
+    async function loadGitHubRuns() {
+      const tbody = document.getElementById('runs-tbody');
+      try {
+        const resp = await fetch('https://api.github.com/repos/waghharesh/bountysweep-agent/actions/runs?per_page=8');
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const data = await resp.json();
+        const runs = data.workflow_runs || [];
+        if (runs.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="5">No workflow runs recorded yet.</td></tr>';
+          return;
+        }
+        tbody.innerHTML = runs.map(r => {
+          let bClass = 'b-blue';
+          let label = r.status;
+          if (r.status === 'completed') {
+            label = r.conclusion || 'completed';
+            bClass = r.conclusion === 'success' ? 'b-green' : (r.conclusion === 'failure' ? 'b-red' : 'b-amber');
+          } else if (r.status === 'in_progress') {
+            label = 'running';
+            bClass = 'b-amber';
+          }
+          const started = r.created_at ? new Date(r.created_at).toISOString().replace('T', ' ').slice(0, 19) : '—';
+          return `
+            <tr>
+              <td class="mono">#${r.run_number}</td>
+              <td><span class="badge ${bClass}">${label.toUpperCase()}</span></td>
+              <td><code>${r.event}</code></td>
+              <td class="mono">${started}</td>
+              <td><a href="${r.html_url}" target="_blank" rel="noopener">View Run ↗</a></td>
+            </tr>
+          `;
+        }).join('');
+      } catch (e) {
+        tbody.innerHTML = `<tr><td colspan="5">Open <a href="https://github.com/waghharesh/bountysweep-agent/actions" target="_blank">GitHub Actions Console ↗</a> to view runs.</td></tr>`;
+      }
+    }
+
+    function refreshAll() {
+      loadStatusJson();
+      loadGitHubRuns();
+    }
+    refreshAll();
+    setInterval(refreshAll, 30000);
+  </script>
+</body>
+</html>

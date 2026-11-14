@@ -1,0 +1,27 @@
+{
+  "status": "running",
+  "paused": false,
+  "dry_run_mode": false,
+  "chain_network": "base",
+  "owner_cold_wallet_address": "0x1FCCE38b01BD7127AC6FA7D2Fc38237F69EeAa70",
+  "worker_wallet_address": "0x9AcEBFfDa3F9a0F711930c91129074161eFDe852",
+  "sweep_threshold_usdc": 5.0,
+  "autopoll_enabled": true,
+  "poll_interval_seconds": 300,
+  "seen_bounties_cached_24h": 2,
+  "metrics": {
+    "bounties_claimed": 0,
+    "solutions_submitted": 0,
+    "bounties_rejected": 0,
+    "payouts_settled_count": 0,
+    "total_usdc_swept": 0.0
+  },
+  "recent_alerts": [],
+  "cycles_executed": 2,
+  "last_cycle": {
+    "status": "no_bounties_found",
+    "paused": false,
+    "detail": "No new open USDC bounties discovered during scan (seen bounties skipped for 24h)."
+  },
+  "last_updated_utc": "2026-11-14T14:07:56.126132+00:00"
+}
