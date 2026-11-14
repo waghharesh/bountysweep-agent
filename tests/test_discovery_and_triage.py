@@ -284,3 +284,104 @@ async def test_triage_engine_with_mocked_google_genai_client() -> None:
     assert result.solvability_score == 19
     assert result.total_score == 36 + 38 + 19
     assert result.approved is True
+
+
+@pytest.mark.asyncio
+async def test_seen_bounties_cache_persists_and_skips_for_24_hours(tmp_path) -> None:
+    """SeenBountiesCache must persist to disk, suppress seen bounty_ids for 24h, and expire after 24h."""
+    from discovery.scanner import BountyBoardAdapter, BountyOpportunity, SeenBountiesCache
+
+    import time
+
+    cache_file = tmp_path / "seen_bounties.json"
+    cache = SeenBountiesCache(cache_path=cache_file, ttl_seconds=86_400)
+
+    bounty = generate_mock_escrowed_bounty()
+    t0 = time.time()
+    assert cache.is_seen(bounty.bounty_id, now=t0) is False
+
+    cache.mark_seen(bounty.bounty_id, status="rejected", now=t0)
+    assert cache.is_seen(bounty.bounty_id, now=t0 + 300) is True
+    assert cache.is_seen(bounty.bounty_id, now=t0 + 86_399) is True
+
+    # Reload from disk into a fresh instance to verify persistence
+    reloaded = SeenBountiesCache(cache_path=cache_file, ttl_seconds=86_400)
+    assert reloaded.is_seen(bounty.bounty_id, now=t0 + 3600) is True
+
+    # Verify BountyScanner.scan_all skips seen bounties within the 24h window
+    class _StaticAdapter(BountyBoardAdapter):
+        async def fetch_open_bounties(self) -> list[BountyOpportunity]:
+            return [bounty]
+
+    scanner = BountyScanner(adapters=[_StaticAdapter()], seen_cache=reloaded)
+    reloaded.mark_seen(bounty.bounty_id, status="rejected")
+    assert await scanner.scan_all(skip_seen=True) == []
+    assert len(await scanner.scan_all(skip_seen=False)) == 1
+
+    # After 24 hours (86,400s), the entry expires and is no longer suppressed
+    assert reloaded.is_seen(bounty.bounty_id, now=t0 + 86_401) is False
+
+
+@pytest.mark.asyncio
+async def test_non_usdc_ledger_prefilter_skips_mrg_and_allows_base_usdc() -> None:
+    """Scanner pre-filter must skip non-USDC ledger tokens (like MergeOS MRG) and accept Base USDC bounties."""
+    from discovery.scanner import BaseUSDCBountyPoller, is_non_usdc_ledger_bounty
+
+    assert (
+        is_non_usdc_ledger_bounty(
+            title="[50 MRG] FastAPI: POST /identify and GET /species/{id}/care",
+            body="Maintainer reviews PR -> merge on PlantGuide -> MRG credit on MergeOS ledger",
+            labels=["bounty", "reward:50-mrg"],
+            repo_owner="mergeos-bounties",
+        )
+        is True
+    )
+
+    assert (
+        is_non_usdc_ledger_bounty(
+            title="[Bounty: 250 USDC] Fix Base ERC-20 transfer batcher",
+            body="Escrowed 250 USDC on Base (0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913).",
+            labels=["bounty", "python"],
+            repo_owner="base-org",
+        )
+        is False
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "number": 9,
+                        "html_url": "https://github.com/mergeos-bounties/PlantGuide/issues/9",
+                        "title": "[50 MRG] FastAPI: POST /identify",
+                        "body": "MRG credit on MergeOS ledger",
+                        "labels": [{"name": "bounty"}, {"name": "reward:50-mrg"}],
+                    },
+                    {
+                        "number": 88,
+                        "html_url": "https://github.com/base-defi/usdc-indexer/issues/88",
+                        "title": "Fix async pagination in Base USDC event indexer (250 USDC)",
+                        "body": "Reward: 250 USDC settled on Base via escrow [escrow:base]",
+                        "labels": [{"name": "bounty"}, {"name": "python"}],
+                    },
+                ]
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    poller = BaseUSDCBountyPoller(
+        settings=Settings(DRY_RUN_MODE=True),
+        http_client=client,
+        search_queries=('is:issue is:open "USDC" python',),
+    )
+    results = await poller.fetch_open_bounties()
+    await client.aclose()
+
+    assert len(results) == 1
+    assert results[0].bounty_id == "github:base-defi/usdc-indexer#88"
+    assert results[0].reward_usdc == 250.0
+    assert results[0].escrow_verified is True
+    assert results[0].escrow_provider == "base-usdc"
+

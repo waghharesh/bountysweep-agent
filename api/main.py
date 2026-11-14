@@ -141,6 +141,7 @@ class BountySweepOrchestrator:
             "sweep_threshold_usdc": self.settings.SWEEP_THRESHOLD_USDC,
             "autopoll_enabled": self.autopoll_enabled,
             "poll_interval_seconds": self.settings.POLL_INTERVAL_SECONDS,
+            "seen_bounties_cached_24h": len(self.scanner.seen_cache.snapshot()),
             "metrics": snap["metrics"],
             "recent_alerts": list(self.telegram_bot.sent_messages[-20:]),
             "cycles_executed": len(self.cycle_history),
@@ -180,12 +181,12 @@ class BountySweepOrchestrator:
         if req.use_mock_bounty:
             bounty = self._resolve_mock_bounty(req.mock_bounty_override)
         else:
-            discovered = await self.scanner.scan_all(verified_only=False)
+            discovered = await self.scanner.scan_all(verified_only=False, skip_seen=True)
             if not discovered:
                 result = {
                     "status": "no_bounties_found",
                     "paused": False,
-                    "detail": "No open bounties discovered during scan.",
+                    "detail": "No new open USDC bounties discovered during scan (seen bounties skipped for 24h).",
                 }
                 self.cycle_history.append(result)
                 return result
@@ -195,6 +196,8 @@ class BountySweepOrchestrator:
         # Step 2: AI Triage & Prompt-Injection / Escrow Screening
         triage_result = await self.triage_engine.evaluate_bounty(bounty)
         if triage_result.security_rejected:
+            if not req.use_mock_bounty:
+                self.scanner.mark_seen(bounty.bounty_id, status="security_rejected")
             await self.telegram_bot.alert_security_rejection(
                 bounty_id=bounty.bounty_id,
                 reasons=triage_result.security_reasons,
@@ -212,6 +215,8 @@ class BountySweepOrchestrator:
             return result
 
         if not triage_result.approved:
+            if not req.use_mock_bounty:
+                self.scanner.mark_seen(bounty.bounty_id, status="rejected")
             if not triage_result.escrow_verified:
                 await self.telegram_bot.alert_security_rejection(
                     bounty_id=bounty.bounty_id,
@@ -258,6 +263,8 @@ class BountySweepOrchestrator:
         )
 
         if not sandbox_report.submission_approved:
+            if not req.use_mock_bounty:
+                self.scanner.mark_seen(bounty.bounty_id, status="sandbox_failed")
             result = {
                 "status": "sandbox_failed",
                 "stage": "sandbox",
@@ -286,6 +293,8 @@ class BountySweepOrchestrator:
                 destination_address=req.destination_wallet_override,
             )
         except UnauthorizedDestinationError as exc:
+            if not req.use_mock_bounty:
+                self.scanner.mark_seen(bounty.bounty_id, status="security_rejected")
             await self.telegram_bot.alert_security_rejection(
                 bounty_id=bounty.bounty_id,
                 reasons=[str(exc)],
@@ -316,6 +325,9 @@ class BountySweepOrchestrator:
                 chain=sweep_receipt.chain,
                 dry_run=sweep_receipt.dry_run,
             )
+
+        if not req.use_mock_bounty:
+            self.scanner.mark_seen(bounty.bounty_id, status="completed")
 
         result = {
             "status": "completed",

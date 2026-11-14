@@ -1,11 +1,14 @@
-"""Bounty discovery engine polling Algora, GitHub escrow issues, and on-chain task boards."""
+"""Bounty discovery engine polling Algora, GitHub escrow issues, Base USDC sources, and on-chain task boards."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
+import time
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -15,18 +18,45 @@ from config.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_SEEN_CACHE_TTL_SECONDS = 86_400  # 24 hours
+DEFAULT_SEEN_CACHE_PATH = Path("/tmp/bountysweep_seen_bounties.json")
+
 _REWARD_DOLLAR_RE = re.compile(
     r"(?:💎|/bounty|bounty[:\s]+|reward[:\s]+|\bUSD[C]?\s*)\s*\$\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)"
     r"|\$\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*(?:USDC|USD|bounty|💎)",
     re.IGNORECASE,
 )
+_USDC_AMOUNT_RE = re.compile(
+    r"\b([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*USDC\b",
+    re.IGNORECASE,
+)
 _GENERIC_DOLLAR_RE = re.compile(r"\$\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)")
 
+_NON_USDC_LEDGER_RE = re.compile(
+    r"(?:\[\s*\d+\s*MRG\s*\]|\b\d+\s*MRG\b|reward:\d+-mrg|\bMRG\s+credit\b|"
+    r"\bMergeOS\s+ledger\b|mergeos-bounties|\[\$0\]|"
+    r"\b\d+\s*(?:XP|kudos|rep\s+points|karma\s+points)\b|"
+    r"\bBountyScout\b|\bAF\s+alert:\s*\d+\s+new\s+paid\s+opportunit|"
+    r"🎯\s*Bounty\s+Alert:)",
+    re.IGNORECASE,
+)
+
 _ESCROW_PROVIDER_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    (
+        "base-usdc",
+        re.compile(
+            r"(?:\bUSDC\b[^\n]{0,50}\bBase\b|\bBase\b[^\n]{0,50}\bUSDC\b|"
+            r"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913|\[escrow:base\])",
+            re.IGNORECASE,
+        ),
+    ),
     ("algora", re.compile(r"(?:console\.algora\.io|algora\.io|/bounty\s+\$|💎\s*\$|\[escrow:algora\])", re.IGNORECASE)),
     ("polar", re.compile(r"(?:polar\.sh|\[escrow:polar\])", re.IGNORECASE)),
     ("opire", re.compile(r"(?:opire\.dev|\[escrow:opire\])", re.IGNORECASE)),
     ("gitcoin", re.compile(r"(?:gitcoin\.co|\[escrow:gitcoin\])", re.IGNORECASE)),
+    ("bountycaster", re.compile(r"(?:bountycaster\.xyz|\[escrow:bountycaster\])", re.IGNORECASE)),
+    ("dework", re.compile(r"(?:dework\.xyz|\[escrow:dework\])", re.IGNORECASE)),
+    ("superteam", re.compile(r"(?:superteam\.fun|\[escrow:superteam\])", re.IGNORECASE)),
     ("verified-escrow", re.compile(r"\[escrow:verified\]", re.IGNORECASE)),
 ]
 
@@ -56,7 +86,7 @@ class BountyOpportunity(BaseModel):
     """Normalized representation of a software or task bounty."""
 
     bounty_id: str
-    platform: str = Field(description="Source platform e.g. 'algora', 'github', 'onchain'")
+    platform: str = Field(description="Source platform e.g. 'algora', 'github', 'base-usdc', 'onchain'")
     repo_owner: str
     repo_name: str
     repo_url: str
@@ -70,6 +100,131 @@ class BountyOpportunity(BaseModel):
     escrow_provider: str | None = None
     tech_tags: list[str] = Field(default_factory=list)
     raw_metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SeenBountiesCache:
+    """Persistent disk-backed TTL cache that skips processed or rejected bounty_ids for 24 hours."""
+
+    def __init__(
+        self,
+        cache_path: str | Path | None = DEFAULT_SEEN_CACHE_PATH,
+        ttl_seconds: int = DEFAULT_SEEN_CACHE_TTL_SECONDS,
+    ) -> None:
+        self.cache_path: Path | None = Path(cache_path) if cache_path else None
+        self.ttl_seconds: int = int(ttl_seconds)
+        self._entries: dict[str, dict[str, Any]] = {}
+        self._load()
+
+    def _load(self) -> None:
+        """Load persisted seen bounty entries from disk if available."""
+        if self.cache_path is None or not self.cache_path.exists():
+            return
+        try:
+            raw = json.loads(self.cache_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                self._entries = {
+                    str(k): v
+                    for k, v in raw.items()
+                    if isinstance(v, dict) and "timestamp" in v
+                }
+                self.prune_expired()
+        except Exception as exc:
+            logger.warning("Failed to load seen_bounties cache from %s: %s", self.cache_path, exc)
+
+    def _save(self) -> None:
+        """Persist current seen bounty entries to disk atomically."""
+        if self.cache_path is None:
+            return
+        try:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self.cache_path.with_suffix(".tmp")
+            tmp_path.write_text(
+                json.dumps(self._entries, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            tmp_path.replace(self.cache_path)
+        except Exception as exc:
+            logger.warning("Failed to save seen_bounties cache to %s: %s", self.cache_path, exc)
+
+    def prune_expired(self, now: float | None = None) -> int:
+        """Remove entries older than ttl_seconds and return count removed."""
+        current_ts = time.time() if now is None else float(now)
+        expired_keys = [
+            bounty_id
+            for bounty_id, meta in self._entries.items()
+            if (current_ts - float(meta.get("timestamp", 0.0))) >= self.ttl_seconds
+        ]
+        for key in expired_keys:
+            self._entries.pop(key, None)
+        if expired_keys:
+            self._save()
+        return len(expired_keys)
+
+    def is_seen(self, bounty_id: str, now: float | None = None) -> bool:
+        """Return True if bounty_id was processed/rejected within the last ttl_seconds (24h)."""
+        current_ts = time.time() if now is None else float(now)
+        entry = self._entries.get(bounty_id)
+        if entry is None:
+            return False
+        age = current_ts - float(entry.get("timestamp", 0.0))
+        if age >= self.ttl_seconds:
+            self._entries.pop(bounty_id, None)
+            self._save()
+            return False
+        return True
+
+    def mark_seen(
+        self,
+        bounty_id: str,
+        status: str = "processed",
+        now: float | None = None,
+    ) -> None:
+        """Record bounty_id in the 24-hour seen cache and persist to disk."""
+        current_ts = time.time() if now is None else float(now)
+        self._entries[bounty_id] = {
+            "timestamp": current_ts,
+            "status": status,
+        }
+        self._save()
+
+    def clear(self) -> None:
+        """Clear all entries in memory and on disk."""
+        self._entries.clear()
+        if self.cache_path is not None and self.cache_path.exists():
+            try:
+                self.cache_path.unlink()
+            except OSError:
+                pass
+
+    def snapshot(self) -> dict[str, dict[str, Any]]:
+        """Return a copy of active (non-expired) seen bounty entries."""
+        self.prune_expired()
+        return dict(self._entries)
+
+
+def is_non_usdc_ledger_bounty(
+    title: str,
+    body: str,
+    labels: list[str] | None = None,
+    repo_owner: str = "",
+) -> bool:
+    """Return True if the issue rewards non-USDC ledger/points tokens (such as MergeOS MRG)."""
+    combined = "\n".join(
+        [
+            title or "",
+            body or "",
+            " ".join(labels or []),
+            repo_owner or "",
+        ]
+    )
+    if not _NON_USDC_LEDGER_RE.search(combined):
+        return False
+    # If it explicitly specifies a real USDC/USD amount > 0 with verified escrow, allow it;
+    # otherwise filter it out as a non-USDC ledger/points issue.
+    has_real_usdc = bool(_USDC_AMOUNT_RE.search(combined) or _REWARD_DOLLAR_RE.search(combined))
+    if has_real_usdc and "[$0]" not in combined.lower():
+        return False
+    return True
 
 
 def extract_tech_tags(title: str, body: str, labels: list[str]) -> list[str]:
@@ -90,9 +245,19 @@ def parse_reward_usd_from_text(text: str) -> float:
     if match:
         amount_str = (match.group(1) or match.group(2) or "0").replace(",", "")
         try:
-            return float(amount_str)
+            val = float(amount_str)
+            if val > 0:
+                return val
         except ValueError:
-            return 0.0
+            pass
+    usdc_match = _USDC_AMOUNT_RE.search(text)
+    if usdc_match:
+        try:
+            val = float(usdc_match.group(1).replace(",", ""))
+            if val > 0:
+                return val
+        except ValueError:
+            pass
     generic = _GENERIC_DOLLAR_RE.search(text)
     if generic:
         try:
@@ -105,7 +270,7 @@ def parse_reward_usd_from_text(text: str) -> float:
 def normalize_github_issue(issue_data: dict[str, Any]) -> BountyOpportunity:
     """Normalize a GitHub REST or GraphQL issue payload into a BountyOpportunity.
 
-    Explicitly verifies escrow markers and rejects unfunded / 'promise-to-pay' issues.
+    Explicitly verifies escrow markers and rejects unfunded / 'promise-to-pay' / non-USDC ledger issues.
     """
     raw_labels = issue_data.get("labels", [])
     if isinstance(raw_labels, dict) and "nodes" in raw_labels:
@@ -163,13 +328,16 @@ def normalize_github_issue(issue_data: dict[str, Any]) -> BountyOpportunity:
     if not html_url:
         html_url = f"{repo_url}/issues/{issue_number}"
 
+    # Check non-USDC ledger token filter (e.g., MRG)
+    non_usdc_ledger = is_non_usdc_ledger_bounty(title, body, labels, repo_owner=repo_owner)
+
     # Parse reward from explicit metadata, labels, or body
     reward_usdc = 0.0
     if "reward_usdc" in issue_data and issue_data["reward_usdc"] is not None:
         reward_usdc = float(issue_data["reward_usdc"])
     elif "reward_cents" in issue_data and issue_data["reward_cents"] is not None:
         reward_usdc = round(float(issue_data["reward_cents"]) / 100.0, 2)
-    else:
+    elif not non_usdc_ledger:
         for lbl in labels:
             amt = parse_reward_usd_from_text(lbl)
             if amt > 0:
@@ -190,11 +358,14 @@ def normalize_github_issue(issue_data: dict[str, Any]) -> BountyOpportunity:
                 escrow_provider = provider_name
                 break
 
-    has_diamond_amount_label = any("💎" in lbl and "$" in lbl for lbl in labels)
+    has_diamond_amount_label = any("💎" in lbl and ("$" in lbl or "usdc" in lbl.lower()) for lbl in labels)
     if has_diamond_amount_label and not escrow_provider:
         escrow_provider = "algora"
 
-    if explicit_escrow_flag is not None:
+    if non_usdc_ledger:
+        escrow_verified = False
+        escrow_provider = None
+    elif explicit_escrow_flag is not None:
         escrow_verified = bool(explicit_escrow_flag) and not has_promise_to_pay and reward_usdc > 0
     else:
         escrow_verified = (
@@ -254,7 +425,7 @@ class OnChainTaskBoardAdapter(BountyBoardAdapter):
             return []
 
         close_client = self._client is None
-        client = self._client or httpx.AsyncClient(timeout=15.0)
+        client = self._client or httpx.AsyncClient(timeout=15.0, follow_redirects=True)
         try:
             response = await client.get(self.endpoint_url)
             response.raise_for_status()
@@ -267,7 +438,11 @@ class OnChainTaskBoardAdapter(BountyBoardAdapter):
                 item_copy = dict(item)
                 item_copy.setdefault("platform", "onchain")
                 item_copy.setdefault("escrow_provider", "onchain-escrow")
-                results.append(normalize_github_issue(item_copy))
+                bounty = normalize_github_issue(item_copy)
+                if not is_non_usdc_ledger_bounty(
+                    bounty.title, bounty.body, bounty.labels, repo_owner=bounty.repo_owner
+                ):
+                    results.append(bounty)
             return results
         except Exception as exc:
             logger.warning("OnChainTaskBoardAdapter poll failed: %s", exc)
@@ -340,7 +515,6 @@ class AlgoraBountyPoller(BountyBoardAdapter):
             reward_usdc = round(float(item["reward_cents"]) / 100.0, 2)
         elif "amount" in item and item["amount"] is not None:
             raw_amt = float(item["amount"])
-            # Treat integer cents if status/currency indicates cents or >= 10000 with cents flag
             if item.get("amount_in_cents", False):
                 reward_usdc = round(raw_amt / 100.0, 2)
             else:
@@ -355,7 +529,9 @@ class AlgoraBountyPoller(BountyBoardAdapter):
         else:
             escrow_verified = bool(escrow_flag) and reward_usdc > 0
 
-        if _PROMISE_TO_PAY_RE.search(f"{title}\n{body}"):
+        if _PROMISE_TO_PAY_RE.search(f"{title}\n{body}") or is_non_usdc_ledger_bounty(
+            title, body, labels, repo_owner=repo_owner
+        ):
             escrow_verified = False
 
         raw_id = item.get("id") or item.get("bounty_id") or f"{repo_owner}/{repo_name}#{issue_number}"
@@ -400,11 +576,16 @@ class AlgoraBountyPoller(BountyBoardAdapter):
                 or data.get("data")
                 or (data if isinstance(data, list) else [])
             )
-            return [
-                self.normalize_algora_item(item)
-                for item in items
-                if isinstance(item, dict)
-            ]
+            results: list[BountyOpportunity] = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                bounty = self.normalize_algora_item(item)
+                if not is_non_usdc_ledger_bounty(
+                    bounty.title, bounty.body, bounty.labels, repo_owner=bounty.repo_owner
+                ):
+                    results.append(bounty)
+            return results
         except Exception as exc:
             logger.warning("AlgoraBountyPoller failed to fetch from %s: %s", url, exc)
             return []
@@ -414,13 +595,13 @@ class AlgoraBountyPoller(BountyBoardAdapter):
 
 
 class GitHubEscrowBountyPoller(BountyBoardAdapter):
-    """Async poller for GitHub issues with verified escrow labels (💎 / bounty)."""
+    """Async poller for GitHub issues with verified USD/USDC escrow labels (💎 / bounty), excluding non-USDC tokens."""
 
     def __init__(
         self,
         settings: Settings | None = None,
         http_client: httpx.AsyncClient | None = None,
-        search_query: str = "is:issue is:open label:bounty python",
+        search_query: str = 'is:issue is:open label:bounty ("USDC" OR "💎" OR "/bounty" OR "algora") python -MRG -MergeOS',
     ) -> None:
         self.settings = settings or get_settings()
         self._client = http_client
@@ -441,7 +622,7 @@ class GitHubEscrowBountyPoller(BountyBoardAdapter):
         return headers
 
     async def fetch_open_bounties(self) -> list[BountyOpportunity]:
-        """Search GitHub REST API for open bounty issues and normalize results."""
+        """Search GitHub REST API for open bounty issues, skipping non-USDC ledger tokens (like MRG)."""
         url = f"{self.settings.GITHUB_API_URL.rstrip('/')}/search/issues"
         close_client = self._client is None
         client = self._client or httpx.AsyncClient(timeout=15.0, follow_redirects=True)
@@ -454,14 +635,85 @@ class GitHubEscrowBountyPoller(BountyBoardAdapter):
             response.raise_for_status()
             payload = response.json()
             items = payload.get("items", [])
-            return [
-                normalize_github_issue(item)
-                for item in items
-                if isinstance(item, dict) and "pull_request" not in item
-            ]
+            results: list[BountyOpportunity] = []
+            for item in items:
+                if not isinstance(item, dict) or "pull_request" in item:
+                    continue
+                bounty = normalize_github_issue(item)
+                if is_non_usdc_ledger_bounty(
+                    bounty.title, bounty.body, bounty.labels, repo_owner=bounty.repo_owner
+                ):
+                    logger.debug("Skipping non-USDC ledger bounty: %s", bounty.bounty_id)
+                    continue
+                results.append(bounty)
+            return results
         except Exception as exc:
             logger.warning("GitHubEscrowBountyPoller failed to fetch from %s: %s", url, exc)
             return []
+        finally:
+            if close_client:
+                await client.aclose()
+
+
+class BaseUSDCBountyPoller(BountyBoardAdapter):
+    """Crypto-native poller specifically targeting Base USDC and on-chain USDC escrowed GitHub bounties."""
+
+    DEFAULT_QUERIES: tuple[str, ...] = (
+        'is:issue is:open "USDC" ("Base" OR "escrow" OR "bounty" OR "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913") python -MRG -MergeOS',
+        'is:issue is:open ("💎" OR "/bounty") "python" ("USDC" OR "$") -MRG -MergeOS',
+    )
+
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        http_client: httpx.AsyncClient | None = None,
+        search_queries: list[str] | tuple[str, ...] | None = None,
+    ) -> None:
+        self.settings = settings or get_settings()
+        self._client = http_client
+        self.search_queries = tuple(search_queries) if search_queries else self.DEFAULT_QUERIES
+
+    def _headers(self) -> dict[str, str]:
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if self.settings.github_token_str:
+            headers["Authorization"] = f"Bearer {self.settings.github_token_str}"
+        return headers
+
+    async def fetch_open_bounties(self) -> list[BountyOpportunity]:
+        """Query crypto-native Base USDC and escrowed USDC bounty queries on GitHub."""
+        url = f"{self.settings.GITHUB_API_URL.rstrip('/')}/search/issues"
+        close_client = self._client is None
+        client = self._client or httpx.AsyncClient(timeout=15.0, follow_redirects=True)
+        discovered: dict[str, BountyOpportunity] = {}
+        try:
+            for query in self.search_queries:
+                try:
+                    response = await client.get(
+                        url,
+                        params={"q": query, "per_page": 25, "sort": "updated", "order": "desc"},
+                        headers=self._headers(),
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                    for item in payload.get("items", []):
+                        if not isinstance(item, dict) or "pull_request" in item:
+                            continue
+                        bounty = normalize_github_issue(item)
+                        if is_non_usdc_ledger_bounty(
+                            bounty.title,
+                            bounty.body,
+                            bounty.labels,
+                            repo_owner=bounty.repo_owner,
+                        ):
+                            continue
+                        if bounty.bounty_id not in discovered:
+                            discovered[bounty.bounty_id] = bounty
+                except Exception as query_exc:
+                    logger.warning("BaseUSDCBountyPoller query '%s' failed: %s", query, query_exc)
+            return list(discovered.values())
         finally:
             if close_client:
                 await client.aclose()
@@ -498,24 +750,49 @@ def generate_mock_escrowed_bounty() -> BountyOpportunity:
 
 
 class BountyScanner:
-    """Concurrent multi-platform bounty discovery coordinator."""
+    """Concurrent multi-platform bounty discovery coordinator with 24-hour persistent seen_bounties cache."""
 
     def __init__(
         self,
         adapters: list[BountyBoardAdapter] | None = None,
         settings: Settings | None = None,
+        seen_cache: SeenBountiesCache | None = None,
+        seen_cache_path: str | Path | None = DEFAULT_SEEN_CACHE_PATH,
+        seen_ttl_seconds: int = DEFAULT_SEEN_CACHE_TTL_SECONDS,
     ) -> None:
         self.settings = settings or get_settings()
+        self.seen_cache = seen_cache or SeenBountiesCache(
+            cache_path=seen_cache_path if adapters is None else None,
+            ttl_seconds=seen_ttl_seconds,
+        )
         if adapters is not None:
             self.adapters = adapters
         else:
             self.adapters = [
                 AlgoraBountyPoller(settings=self.settings),
                 GitHubEscrowBountyPoller(settings=self.settings),
+                BaseUSDCBountyPoller(settings=self.settings),
             ]
 
-    async def scan_all(self, verified_only: bool = False) -> list[BountyOpportunity]:
-        """Concurrently poll all configured bounty adapters and deduplicate by bounty_id."""
+    def is_seen(self, bounty_id: str, now: float | None = None) -> bool:
+        """Check if a bounty_id is currently suppressed in the 24-hour seen cache."""
+        return self.seen_cache.is_seen(bounty_id, now=now)
+
+    def mark_seen(
+        self,
+        bounty_id: str,
+        status: str = "processed",
+        now: float | None = None,
+    ) -> None:
+        """Mark a bounty_id as processed/rejected in the 24-hour seen cache."""
+        self.seen_cache.mark_seen(bounty_id, status=status, now=now)
+
+    async def scan_all(
+        self,
+        verified_only: bool = False,
+        skip_seen: bool = True,
+    ) -> list[BountyOpportunity]:
+        """Concurrently poll all configured bounty adapters, pre-filter non-USDC tokens, and skip seen bounties."""
         tasks = [adapter.fetch_open_bounties() for adapter in self.adapters]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -525,6 +802,16 @@ class BountyScanner:
                 logger.warning("Bounty adapter raised exception during scan: %s", res)
                 continue
             for bounty in res:
+                if is_non_usdc_ledger_bounty(
+                    bounty.title,
+                    bounty.body,
+                    bounty.labels,
+                    repo_owner=bounty.repo_owner,
+                ):
+                    continue
+                if skip_seen and self.seen_cache.is_seen(bounty.bounty_id):
+                    logger.debug("Skipping recently seen bounty (24h cache): %s", bounty.bounty_id)
+                    continue
                 if verified_only and not bounty.escrow_verified:
                     continue
                 if bounty.bounty_id not in deduped:
