@@ -2,6 +2,7 @@
 
 from discovery.scanner import (
     MAX_CANDIDATES_PER_CYCLE,
+    THREE_QUERY_DISCOVERY_FUNNEL,
     VERIFIED_ESCROW_BOT_LOGINS,
     AlgoraBountyPoller,
     BaseUSDCBountyPoller,
@@ -11,6 +12,7 @@ from discovery.scanner import (
     GitHubEscrowBountyPoller,
     OnChainTaskBoardAdapter,
     SeenBountiesCache,
+    fetch_and_attach_issue_comments,
     generate_mock_escrowed_bounty,
     has_verified_escrow_signature_or_marker,
     is_aggregator_or_digest_issue,
@@ -20,6 +22,7 @@ from discovery.scanner import (
 
 __all__ = [
     "MAX_CANDIDATES_PER_CYCLE",
+    "THREE_QUERY_DISCOVERY_FUNNEL",
     "VERIFIED_ESCROW_BOT_LOGINS",
     "AlgoraBountyPoller",
     "BaseUSDCBountyPoller",
@@ -29,6 +32,7 @@ __all__ = [
     "GitHubEscrowBountyPoller",
     "OnChainTaskBoardAdapter",
     "SeenBountiesCache",
+    "fetch_and_attach_issue_comments",
     "generate_mock_escrowed_bounty",
     "has_verified_escrow_signature_or_marker",
     "is_aggregator_or_digest_issue",

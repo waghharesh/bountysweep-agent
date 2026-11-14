@@ -142,6 +142,7 @@ class BountySweepOrchestrator:
             "autopoll_enabled": self.autopoll_enabled,
             "poll_interval_seconds": self.settings.POLL_INTERVAL_SECONDS,
             "seen_bounties_cached_24h": len(self.scanner.seen_cache.snapshot()),
+            "raw_candidates_fetched": self.scanner.last_raw_candidates_fetched,
             "metrics": snap["metrics"],
             "recent_alerts": list(self.telegram_bot.sent_messages[-20:]),
             "cycles_executed": len(self.cycle_history),
@@ -174,11 +175,13 @@ class BountySweepOrchestrator:
             return {
                 "status": "paused",
                 "paused": True,
+                "raw_candidates_fetched": 0,
                 "detail": "BountySweep Agent is currently paused via kill-switch.",
             }
 
         # Step 1 & 2: Discovery, Escrow Marker Pre-Filter & AI Triage (up to 15 unseen candidates per cycle)
         if req.use_mock_bounty:
+            raw_candidates_fetched = 1
             bounty = self._resolve_mock_bounty(req.mock_bounty_override)
             triage_result = await self.triage_engine.evaluate_bounty(bounty)
             if triage_result.security_rejected:
@@ -190,6 +193,7 @@ class BountySweepOrchestrator:
                 result = {
                     "status": "security_rejected",
                     "stage": "triage",
+                    "raw_candidates_fetched": raw_candidates_fetched,
                     "security_rejected": True,
                     "security_reasons": triage_result.security_reasons,
                     "bounty": bounty.model_dump(),
@@ -208,6 +212,7 @@ class BountySweepOrchestrator:
                 result = {
                     "status": "rejected",
                     "stage": "triage",
+                    "raw_candidates_fetched": raw_candidates_fetched,
                     "security_rejected": False,
                     "bounty": bounty.model_dump(),
                     "triage": triage_result.model_dump(),
@@ -220,10 +225,12 @@ class BountySweepOrchestrator:
                     triage_evaluator=self.triage_engine,
                 )
             )
+            raw_candidates_fetched = self.scanner.last_raw_candidates_fetched
             if not batch_log:
                 result = {
                     "status": "no_bounties_found",
                     "paused": False,
+                    "raw_candidates_fetched": raw_candidates_fetched,
                     "detail": "No new open USDC bounties discovered during scan (seen bounties skipped for 24h).",
                 }
                 self.cycle_history.append(result)
@@ -244,6 +251,7 @@ class BountySweepOrchestrator:
                 result = {
                     "status": "security_rejected" if last_entry["security_rejected"] else "rejected",
                     "stage": "triage_batch",
+                    "raw_candidates_fetched": raw_candidates_fetched,
                     "security_rejected": bool(last_entry["security_rejected"]),
                     "candidates_evaluated": len(batch_log),
                     "rejected_bounty_ids": [e["bounty_id"] for e in batch_log],
@@ -292,6 +300,7 @@ class BountySweepOrchestrator:
             result = {
                 "status": "sandbox_failed",
                 "stage": "sandbox",
+                "raw_candidates_fetched": raw_candidates_fetched,
                 "bounty": bounty.model_dump(),
                 "triage": triage_result.model_dump(),
                 "claim_receipt": claim_receipt.model_dump(),
@@ -327,6 +336,7 @@ class BountySweepOrchestrator:
             result = {
                 "status": "security_rejected",
                 "stage": "payout_sweep",
+                "raw_candidates_fetched": raw_candidates_fetched,
                 "security_rejected": True,
                 "security_reasons": [str(exc)],
                 "bounty": bounty.model_dump(),
@@ -357,6 +367,7 @@ class BountySweepOrchestrator:
             "status": "completed",
             "paused": False,
             "dry_run": self.settings.DRY_RUN_MODE,
+            "raw_candidates_fetched": raw_candidates_fetched,
             "bounty": bounty.model_dump(),
             "triage": triage_result.model_dump(),
             "claim_receipt": claim_receipt.model_dump(),

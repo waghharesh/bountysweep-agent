@@ -516,3 +516,128 @@ async def test_poll_batch_iterates_up_to_15_candidates_and_caches_rejections(tmp
         assert cache.is_seen(f"github:unverified/repo#{i}") is True
 
 
+@pytest.mark.asyncio
+async def test_three_query_discovery_funnel_comment_escrow_and_raw_candidates_fetched(tmp_path) -> None:
+    """Verify the 3-query discovery funnel, comment-based escrow confirmation without 'Base' in body, and raw_candidates_fetched."""
+    from api.main import BountySweepOrchestrator, CycleRunRequest
+    from discovery.scanner import (
+        THREE_QUERY_DISCOVERY_FUNNEL,
+        BaseUSDCBountyPoller,
+        SeenBountiesCache,
+    )
+
+    assert THREE_QUERY_DISCOVERY_FUNNEL == (
+        'is:open is:issue "algora.io"',
+        'is:open is:issue "opire.dev"',
+        'is:open is:issue "USDC" "bounty" -label:bounty-alert',
+    )
+
+    queries_executed: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url_str = str(request.url)
+        if "/search/issues" in url_str:
+            q = request.url.params.get("q", "")
+            queries_executed.append(q)
+            if "algora.io" in q:
+                return httpx.Response(
+                    200,
+                    json={
+                        "items": [
+                            {
+                                "number": 301,
+                                "html_url": "https://github.com/py-org/fastapi-tool/issues/301",
+                                "comments_url": "https://api.github.com/repos/py-org/fastapi-tool/issues/301/comments",
+                                "comments": 1,
+                                "title": "Fix async Pydantic validation bug in FastAPI endpoint",
+                                # Note: Neither 'Base' nor dollar amount is in the issue body!
+                                "body": "When passing nested JSON payloads, validation fails. Add pytest regression test.",
+                                "labels": [{"name": "python"}, {"name": "bug"}],
+                                "user": {"login": "maintainer-dev"},
+                            }
+                        ]
+                    },
+                )
+            if "opire.dev" in q:
+                return httpx.Response(
+                    200,
+                    json={
+                        "items": [
+                            {
+                                "number": 302,
+                                "html_url": "https://github.com/py-org/parser/issues/302",
+                                "comments_url": "https://api.github.com/repos/py-org/parser/issues/302/comments",
+                                "comments": 1,
+                                "title": "Fix CSV parser edge case",
+                                "body": "Parser crashes on empty trailing column.",
+                                "labels": [{"name": "python"}],
+                                "user": {"login": "maintainer-dev"},
+                            }
+                        ]
+                    },
+                )
+            return httpx.Response(200, json={"items": []})
+
+        if "/issues/301/comments" in url_str:
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "user": {"login": "algora-pbc[bot]"},
+                        "body": "💎 $175.00 bounty funded! Solve at https://console.algora.io/org/bounties/301",
+                    }
+                ],
+            )
+        if "/issues/302/comments" in url_str:
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "user": {"login": "polar-sh[bot]"},
+                        "body": "Funded with $120 USDC via https://polar.sh/py-org/parser/issues/302",
+                    }
+                ],
+            )
+        return httpx.Response(200, json=[])
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        poller = BaseUSDCBountyPoller(
+            settings=Settings(DRY_RUN_MODE=True),
+            http_client=client,
+        )
+        cache = SeenBountiesCache(cache_path=tmp_path / "funnel_seen.json", ttl_seconds=86_400)
+        scanner = BountyScanner(adapters=[poller], seen_cache=cache)
+        bounties = await scanner.scan_all(verified_only=True)
+
+        assert tuple(queries_executed) == THREE_QUERY_DISCOVERY_FUNNEL
+        assert scanner.last_raw_candidates_fetched == 2
+        assert len(bounties) == 2
+
+        by_id = {b.bounty_id: b for b in bounties}
+        b301 = by_id["github:py-org/fastapi-tool#301"]
+        assert b301.escrow_verified is True
+        assert b301.escrow_provider == "algora"
+        assert b301.reward_usdc == 175.0
+
+        b302 = by_id["github:py-org/parser#302"]
+        assert b302.escrow_verified is True
+        assert b302.escrow_provider == "polar"
+        assert b302.reward_usdc == 120.0
+
+        # Also verify orchestrator exposes raw_candidates_fetched in last_cycle status output
+        orchestrator = BountySweepOrchestrator(
+            settings=Settings(
+                DRY_RUN_MODE=True,
+                OWNER_COLD_WALLET_ADDRESS="0x1FCCE38b01BD7127AC6FA7D2Fc38237F69EeAa70",
+            ),
+            scanner=BountyScanner(
+                adapters=[poller],
+                seen_cache=SeenBountiesCache(cache_path=tmp_path / "orch_seen.json", ttl_seconds=86_400),
+            ),
+        )
+        queries_executed.clear()
+        cycle_res = await orchestrator.run_cycle(CycleRunRequest(use_mock_bounty=False))
+        assert cycle_res["raw_candidates_fetched"] == 2
+        status_out = orchestrator.get_status()
+        assert status_out["last_cycle"] is not None
+        assert status_out["last_cycle"]["raw_candidates_fetched"] == 2

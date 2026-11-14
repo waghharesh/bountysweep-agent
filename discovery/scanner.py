@@ -1,4 +1,4 @@
-"""Bounty discovery engine polling Algora, GitHub escrow issues, Base USDC sources, and on-chain task boards."""
+"""Bounty discovery engine polling Algora, GitHub 3-query discovery funnel, and on-chain task boards."""
 
 from __future__ import annotations
 
@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 DEFAULT_SEEN_CACHE_TTL_SECONDS = 86_400  # 24 hours
 DEFAULT_SEEN_CACHE_PATH = Path("/tmp/bountysweep_seen_bounties.json")
 MAX_CANDIDATES_PER_CYCLE = 15
+
+THREE_QUERY_DISCOVERY_FUNNEL: tuple[str, str, str] = (
+    'is:open is:issue "algora.io"',
+    'is:open is:issue "opire.dev"',
+    'is:open is:issue "USDC" "bounty" -label:bounty-alert',
+)
 
 VERIFIED_ESCROW_BOT_LOGINS: frozenset[str] = frozenset(
     {
@@ -71,14 +77,20 @@ _NON_USDC_LEDGER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Verified escrow bot signatures or USDC escrow links/markers (does NOT require 'Base' in issue body)
 _EXPLICIT_USDC_OR_BASE_ESCROW_RE = re.compile(
     r"(?:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913|"
-    r"\[escrow:(?:verified|base|algora|opire|polar|gitcoin|bountycaster|dework|superteam)\]|"
+    r"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48|"
+    r"\[escrow:(?:verified|base|usdc|algora|opire|polar|gitcoin|bountycaster|dework|superteam)\]|"
     r"algora-pbc\[bot\]|opire-bot\[bot\]|polar-sh\[bot\]|"
+    r"https?://(?:console\.)?algora\.io/[^\s)\"']*|"
+    r"https?://(?:app\.)?opire\.dev/[^\s)\"']*|"
+    r"https?://polar\.sh/[^\s)\"']*|"
+    r"https?://(?:basescan\.org|etherscan\.io|arbiscan\.io|optimistic\.etherscan\.io)/tx/0x[a-fA-F0-9]+|"
     r"console\.algora\.io|algora\.io|opire\.dev|polar\.sh|bountycaster\.xyz|"
     r"/bounty\s+\$\s*[0-9]+|💎\s*\$\s*[0-9]+|"
-    r"\b[0-9][0-9,]*(?:\.[0-9]{1,2})?\s*USDC\b[^\n]{0,60}\b(?:Base|escrow|escrowed|verified)\b|"
-    r"\b(?:Base|escrow|escrowed)\b[^\n]{0,60}\b[0-9][0-9,]*(?:\.[0-9]{1,2})?\s*USDC\b)",
+    r"\b[0-9][0-9,]*(?:\.[0-9]{1,2})?\s*USDC\b|"
+    r"\$\s*[0-9][0-9,]*(?:\.[0-9]{1,2})?\s*USDC\b)",
     re.IGNORECASE,
 )
 
@@ -101,7 +113,7 @@ _ESCROW_PROVIDER_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
         "opire",
         re.compile(
-            r"(?:opire-bot\[bot\]|opire\.dev|\[escrow:opire\])",
+            r"(?:opire-bot\[bot\]|app\.opire\.dev|opire\.dev|\[escrow:opire\])",
             re.IGNORECASE,
         ),
     ),
@@ -117,6 +129,13 @@ _ESCROW_PROVIDER_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("dework", re.compile(r"(?:dework\.xyz|\[escrow:dework\])", re.IGNORECASE)),
     ("superteam", re.compile(r"(?:superteam\.fun|\[escrow:superteam\])", re.IGNORECASE)),
     ("verified-escrow", re.compile(r"\[escrow:verified\]", re.IGNORECASE)),
+    (
+        "usdc-escrow",
+        re.compile(
+            r"(?:\b[0-9][0-9,]*(?:\.[0-9]{1,2})?\s*USDC\b|\$\s*[0-9][0-9,]*(?:\.[0-9]{1,2})?\s*USDC\b|\[escrow:usdc\])",
+            re.IGNORECASE,
+        ),
+    ),
 ]
 
 _PROMISE_TO_PAY_RE = re.compile(
@@ -307,10 +326,35 @@ def is_aggregator_or_digest_issue(
     return False
 
 
+def _extract_comments_metadata(raw: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """Extract lowercase comment author logins and comment body strings from issue raw metadata."""
+    comments_list = raw.get("comments_list") or raw.get("comments_data") or []
+    comment_logins: list[str] = []
+    comment_bodies: list[str] = []
+    if isinstance(comments_list, list):
+        for comment in comments_list:
+            if isinstance(comment, dict):
+                c_user = comment.get("user") or comment.get("author") or {}
+                c_login = (
+                    str(c_user.get("login") if isinstance(c_user, dict) else c_user or "")
+                    .strip()
+                    .lower()
+                )
+                c_body = str(comment.get("body") or "")
+                if c_login:
+                    comment_logins.append(c_login)
+                if c_body:
+                    comment_bodies.append(c_body)
+    return comment_logins, comment_bodies
+
+
 def has_verified_escrow_signature_or_marker(
     issue_data_or_bounty: dict[str, Any] | BountyOpportunity,
 ) -> bool:
-    """Check for verified escrow bot signatures (e.g., algora-pbc[bot], opire-bot[bot]) or explicit USDC/Base escrow markers."""
+    """Verify escrow by checking issue comments/authors for official escrow bot confirmations
+    (algora-pbc[bot], opire-bot[bot], polar-sh[bot]) or verified USDC escrow links/markers.
+    Does NOT require the word 'Base' to appear in the issue body.
+    """
     if isinstance(issue_data_or_bounty, BountyOpportunity):
         bounty = issue_data_or_bounty
         raw = bounty.raw_metadata or {}
@@ -335,7 +379,11 @@ def has_verified_escrow_signature_or_marker(
         if bool(raw.get("escrow_verified")) and float(raw.get("reward_usdc") or 0.0) > 0:
             return True
 
-    # 1. Check author / bot login or comment authors in raw metadata
+    combined_issue = f"{' '.join(labels)}\n{title}\n{body}"
+    if _PROMISE_TO_PAY_RE.search(combined_issue):
+        return False
+
+    # 1. Check issue author / bot signature
     user_obj = raw.get("user") or raw.get("author") or {}
     user_login = (
         str(user_obj.get("login") if isinstance(user_obj, dict) else user_obj or "")
@@ -349,31 +397,20 @@ def has_verified_escrow_signature_or_marker(
     if escrow_bot in VERIFIED_ESCROW_BOT_LOGINS:
         return True
 
-    comments_list = raw.get("comments_list") or raw.get("comments_data") or []
-    if isinstance(comments_list, list):
-        for comment in comments_list:
-            if isinstance(comment, dict):
-                c_user = comment.get("user") or comment.get("author") or {}
-                c_login = (
-                    str(c_user.get("login") if isinstance(c_user, dict) else c_user or "")
-                    .strip()
-                    .lower()
-                )
-                c_body = str(comment.get("body") or "")
-                if c_login in VERIFIED_ESCROW_BOT_LOGINS:
-                    return True
-                if _EXPLICIT_USDC_OR_BASE_ESCROW_RE.search(c_body):
-                    return True
+    # 2. Check issue comments for official escrow bot confirmations or verified USDC escrow links
+    comment_logins, comment_bodies = _extract_comments_metadata(raw)
+    for c_login in comment_logins:
+        if c_login in VERIFIED_ESCROW_BOT_LOGINS:
+            return True
+    for c_body in comment_bodies:
+        if not _PROMISE_TO_PAY_RE.search(c_body) and _EXPLICIT_USDC_OR_BASE_ESCROW_RE.search(c_body):
+            return True
 
-    # 2. Check labels and issue text for explicit escrow bot signatures or Base/USDC escrow markers
+    # 3. Check labels and issue text for verified USDC escrow links or diamond/bounty markers
     if any("💎" in lbl and ("$" in lbl or "usdc" in lbl.lower()) for lbl in labels):
         return True
 
-    combined = f"{' '.join(labels)}\n{title}\n{body}"
-    if _PROMISE_TO_PAY_RE.search(combined):
-        return False
-
-    if _EXPLICIT_USDC_OR_BASE_ESCROW_RE.search(combined):
+    if _EXPLICIT_USDC_OR_BASE_ESCROW_RE.search(combined_issue):
         return True
 
     return False
@@ -413,7 +450,7 @@ def extract_tech_tags(title: str, body: str, labels: list[str]) -> list[str]:
 
 
 def parse_reward_usd_from_text(text: str) -> float:
-    """Parse a USD/USDC bounty amount from labels or issue text."""
+    """Parse a USD/USDC bounty amount from labels, issue text, or escrow bot comments."""
     if not text:
         return 0.0
     match = _REWARD_DOLLAR_RE.search(text)
@@ -445,7 +482,8 @@ def parse_reward_usd_from_text(text: str) -> float:
 def normalize_github_issue(issue_data: dict[str, Any]) -> BountyOpportunity:
     """Normalize a GitHub REST or GraphQL issue payload into a BountyOpportunity.
 
-    Explicitly verifies escrow bot signatures/markers and rejects unfunded / 'promise-to-pay' / non-USDC ledger issues.
+    Verifies escrow via issue comments (algora-pbc[bot], opire-bot[bot], polar-sh[bot]) or verified
+    USDC escrow links without requiring 'Base' in the issue body.
     """
     raw_labels = issue_data.get("labels", [])
     if isinstance(raw_labels, dict) and "nodes" in raw_labels:
@@ -503,12 +541,15 @@ def normalize_github_issue(issue_data: dict[str, Any]) -> BountyOpportunity:
     if not html_url:
         html_url = f"{repo_url}/issues/{issue_number}"
 
+    comment_logins, comment_bodies = _extract_comments_metadata(issue_data)
+    comments_text = "\n".join(comment_bodies)
+
     # Check non-USDC ledger token or aggregator/digest filter
     non_usdc_or_aggregator = is_non_usdc_ledger_bounty(
         title, body, labels, repo_owner=repo_owner
     ) or is_aggregator_or_digest_issue(issue_data)
 
-    # Parse reward from explicit metadata, labels, or body
+    # Parse reward from explicit metadata, labels, issue body, or escrow bot comments
     reward_usdc = 0.0
     if "reward_usdc" in issue_data and issue_data["reward_usdc"] is not None:
         reward_usdc = float(issue_data["reward_usdc"])
@@ -522,9 +563,12 @@ def normalize_github_issue(issue_data: dict[str, Any]) -> BountyOpportunity:
                 break
         if reward_usdc <= 0:
             reward_usdc = parse_reward_usd_from_text(f"{title}\n{body}")
+        if reward_usdc <= 0 and comments_text:
+            reward_usdc = parse_reward_usd_from_text(comments_text)
 
-    combined_text = f"{' '.join(labels)}\n{title}\n{body}"
-    has_promise_to_pay = bool(_PROMISE_TO_PAY_RE.search(combined_text))
+    combined_issue_text = f"{' '.join(labels)}\n{title}\n{body}"
+    combined_all_text = f"{combined_issue_text}\n{comments_text}"
+    has_promise_to_pay = bool(_PROMISE_TO_PAY_RE.search(combined_issue_text))
 
     escrow_provider: str | None = issue_data.get("escrow_provider")
     explicit_escrow_flag = issue_data.get("escrow_verified")
@@ -536,17 +580,18 @@ def normalize_github_issue(issue_data: dict[str, Any]) -> BountyOpportunity:
         .lower()
     )
     escrow_bot = str(issue_data.get("escrow_bot") or issue_data.get("bot_signature") or "").strip().lower()
+    all_bot_logins = [user_login, escrow_bot, *comment_logins]
 
     if not escrow_provider:
-        if "algora" in user_login or "algora" in escrow_bot:
+        if any("algora" in login for login in all_bot_logins if login):
             escrow_provider = "algora"
-        elif "opire" in user_login or "opire" in escrow_bot:
+        elif any("opire" in login for login in all_bot_logins if login):
             escrow_provider = "opire"
-        elif "polar" in user_login or "polar" in escrow_bot:
+        elif any("polar" in login for login in all_bot_logins if login):
             escrow_provider = "polar"
         else:
             for provider_name, pattern in _ESCROW_PROVIDER_PATTERNS:
-                if pattern.search(combined_text):
+                if pattern.search(combined_all_text):
                     escrow_provider = provider_name
                     break
 
@@ -555,6 +600,19 @@ def normalize_github_issue(issue_data: dict[str, Any]) -> BountyOpportunity:
         escrow_provider = "algora"
 
     has_verified_marker = has_verified_escrow_signature_or_marker(issue_data)
+
+    # If an official escrow bot comment (algora-pbc[bot], opire-bot[bot], polar-sh[bot]) confirmed escrow
+    # via an SVG badge where the dollar amount is embedded in an image URL rather than plain text, assign a floor
+    has_official_bot_confirmation = any(
+        login in VERIFIED_ESCROW_BOT_LOGINS for login in all_bot_logins if login
+    )
+    if (
+        not non_usdc_or_aggregator
+        and not has_promise_to_pay
+        and reward_usdc <= 0
+        and has_official_bot_confirmation
+    ):
+        reward_usdc = 50.0
 
     if non_usdc_or_aggregator:
         escrow_verified = False
@@ -575,7 +633,7 @@ def normalize_github_issue(issue_data: dict[str, Any]) -> BountyOpportunity:
         or f"github:{repo_owner}/{repo_name}#{issue_number}"
     )
 
-    tech_tags = issue_data.get("tech_tags") or extract_tech_tags(title, body, labels)
+    tech_tags = issue_data.get("tech_tags") or extract_tech_tags(title, f"{body}\n{comments_text}", labels)
 
     return BountyOpportunity(
         bounty_id=bounty_id,
@@ -596,8 +654,42 @@ def normalize_github_issue(issue_data: dict[str, Any]) -> BountyOpportunity:
     )
 
 
+async def fetch_and_attach_issue_comments(
+    client: httpx.AsyncClient,
+    issue_data: dict[str, Any],
+    headers: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Fetch issue comments from GitHub comments_url to inspect for official escrow bot confirmations."""
+    if "comments_list" in issue_data and isinstance(issue_data["comments_list"], list):
+        return issue_data["comments_list"]
+    if "comments_data" in issue_data and isinstance(issue_data["comments_data"], list):
+        return issue_data["comments_data"]
+
+    comments_url = str(issue_data.get("comments_url") or "").strip()
+    comments_count = int(issue_data.get("comments", 1) if "comments" in issue_data else 1)
+    if not comments_url or comments_count <= 0:
+        return []
+
+    try:
+        resp = await client.get(
+            comments_url,
+            params={"per_page": 30},
+            headers=headers,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        if isinstance(payload, list):
+            issue_data["comments_list"] = payload
+            return payload
+    except Exception as exc:
+        logger.debug("Failed to fetch issue comments from %s: %s", comments_url, exc)
+    return []
+
+
 class BountyBoardAdapter(ABC):
     """Abstract base adapter for any bounty board or task marketplace."""
+
+    last_raw_candidates_fetched: int = 0
 
     @abstractmethod
     async def fetch_open_bounties(self) -> list[BountyOpportunity]:
@@ -614,9 +706,11 @@ class OnChainTaskBoardAdapter(BountyBoardAdapter):
     ) -> None:
         self.endpoint_url = endpoint_url
         self._client = http_client
+        self.last_raw_candidates_fetched: int = 0
 
     async def fetch_open_bounties(self) -> list[BountyOpportunity]:
         """Query an on-chain indexer endpoint if configured, otherwise return empty list."""
+        self.last_raw_candidates_fetched = 0
         if not self.endpoint_url:
             return []
 
@@ -627,6 +721,8 @@ class OnChainTaskBoardAdapter(BountyBoardAdapter):
             response.raise_for_status()
             payload = response.json()
             items = payload.get("bounties", payload if isinstance(payload, list) else [])
+            if isinstance(items, list):
+                self.last_raw_candidates_fetched = len(items)
             results: list[BountyOpportunity] = []
             for item in items:
                 if not isinstance(item, dict) or is_aggregator_or_digest_issue(item):
@@ -658,6 +754,7 @@ class AlgoraBountyPoller(BountyBoardAdapter):
     ) -> None:
         self.settings = settings or get_settings()
         self._client = http_client
+        self.last_raw_candidates_fetched: int = 0
 
     def normalize_algora_item(self, item: dict[str, Any]) -> BountyOpportunity:
         """Normalize a single Algora bounty entry into a BountyOpportunity."""
@@ -757,6 +854,7 @@ class AlgoraBountyPoller(BountyBoardAdapter):
 
     async def fetch_open_bounties(self) -> list[BountyOpportunity]:
         """Poll the Algora API for open escrowed bounties."""
+        self.last_raw_candidates_fetched = 0
         url = f"{self.settings.ALGORA_API_URL.rstrip('/')}/bounties"
         close_client = self._client is None
         client = self._client or httpx.AsyncClient(timeout=15.0, follow_redirects=True)
@@ -774,6 +872,8 @@ class AlgoraBountyPoller(BountyBoardAdapter):
                 or data.get("data")
                 or (data if isinstance(data, list) else [])
             )
+            if isinstance(items, list):
+                self.last_raw_candidates_fetched = len(items)
             results: list[BountyOpportunity] = []
             for item in items:
                 if not isinstance(item, dict) or is_aggregator_or_digest_issue(item):
@@ -793,20 +893,27 @@ class AlgoraBountyPoller(BountyBoardAdapter):
 
 
 class GitHubEscrowBountyPoller(BountyBoardAdapter):
-    """Async poller for GitHub issues with verified USD/USDC escrow labels (💎 / bounty), excluding non-USDC tokens & bots."""
+    """Async poller for GitHub issues using the 3-query discovery funnel and issue comment escrow verification."""
+
+    DEFAULT_QUERIES: tuple[str, ...] = THREE_QUERY_DISCOVERY_FUNNEL
 
     def __init__(
         self,
         settings: Settings | None = None,
         http_client: httpx.AsyncClient | None = None,
-        search_query: str = (
-            'is:issue is:open label:bounty ("USDC" OR "💎" OR "/bounty" OR "algora" OR "opire") '
-            'python -MRG -MergeOS -label:bounty-alert -author:app/github-actions'
-        ),
+        search_query: str | None = None,
+        search_queries: list[str] | tuple[str, ...] | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self._client = http_client
-        self.search_query = search_query
+        if search_queries is not None:
+            self.search_queries: tuple[str, ...] = tuple(search_queries)
+        elif search_query is not None:
+            self.search_queries = (search_query,)
+        else:
+            self.search_queries = self.DEFAULT_QUERIES
+        self.search_query = self.search_queries[0]
+        self.last_raw_candidates_fetched: int = 0
 
     @staticmethod
     def normalize_github_issue(issue_data: dict[str, Any]) -> BountyOpportunity:
@@ -823,49 +930,57 @@ class GitHubEscrowBountyPoller(BountyBoardAdapter):
         return headers
 
     async def fetch_open_bounties(self) -> list[BountyOpportunity]:
-        """Search GitHub REST API for open bounty issues, skipping aggregators and non-USDC ledger tokens."""
+        """Search GitHub REST API using the configured discovery funnel and inspect issue comments for escrow bots."""
+        self.last_raw_candidates_fetched = 0
         url = f"{self.settings.GITHUB_API_URL.rstrip('/')}/search/issues"
         close_client = self._client is None
         client = self._client or httpx.AsyncClient(timeout=15.0, follow_redirects=True)
+        headers = self._headers()
+        discovered: dict[str, BountyOpportunity] = {}
+        comments_fetched = 0
         try:
-            response = await client.get(
-                url,
-                params={"q": self.search_query, "per_page": 30, "sort": "updated", "order": "desc"},
-                headers=self._headers(),
-            )
-            response.raise_for_status()
-            payload = response.json()
-            items = payload.get("items", [])
-            results: list[BountyOpportunity] = []
-            for item in items:
-                if not isinstance(item, dict) or "pull_request" in item:
-                    continue
-                if is_aggregator_or_digest_issue(item):
-                    logger.debug("Skipping aggregator/digest issue from user or label.")
-                    continue
-                bounty = normalize_github_issue(item)
-                if is_non_usdc_ledger_bounty(
-                    bounty.title, bounty.body, bounty.labels, repo_owner=bounty.repo_owner
-                ):
-                    logger.debug("Skipping non-USDC ledger bounty: %s", bounty.bounty_id)
-                    continue
-                results.append(bounty)
-            return results
-        except Exception as exc:
-            logger.warning("GitHubEscrowBountyPoller failed to fetch from %s: %s", url, exc)
-            return []
+            for query in self.search_queries:
+                try:
+                    response = await client.get(
+                        url,
+                        params={"q": query, "per_page": 25, "sort": "updated", "order": "desc"},
+                        headers=headers,
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                    items = payload.get("items", [])
+                    if isinstance(items, list):
+                        self.last_raw_candidates_fetched += len(items)
+                    for item in items:
+                        if not isinstance(item, dict) or "pull_request" in item:
+                            continue
+                        if is_aggregator_or_digest_issue(item):
+                            logger.debug("Skipping aggregator/digest issue from user or label.")
+                            continue
+                        item_copy = dict(item)
+                        if comments_fetched < MAX_CANDIDATES_PER_CYCLE and item_copy.get("comments_url"):
+                            await fetch_and_attach_issue_comments(client, item_copy, headers)
+                            comments_fetched += 1
+                        bounty = normalize_github_issue(item_copy)
+                        if is_non_usdc_ledger_bounty(
+                            bounty.title, bounty.body, bounty.labels, repo_owner=bounty.repo_owner
+                        ):
+                            logger.debug("Skipping non-USDC ledger bounty: %s", bounty.bounty_id)
+                            continue
+                        if bounty.bounty_id not in discovered:
+                            discovered[bounty.bounty_id] = bounty
+                except Exception as query_exc:
+                    logger.warning("GitHubEscrowBountyPoller query '%s' failed: %s", query, query_exc)
+            return list(discovered.values())
         finally:
             if close_client:
                 await client.aclose()
 
 
 class BaseUSDCBountyPoller(BountyBoardAdapter):
-    """Crypto-native poller specifically targeting Base USDC and verified escrow bot signatures on GitHub."""
+    """3-query discovery funnel poller verifying escrow via issue comments (algora-pbc[bot], opire-bot[bot], polar-sh[bot]) or USDC links."""
 
-    DEFAULT_QUERIES: tuple[str, ...] = (
-        'is:issue is:open "USDC" ("Base" OR "escrow" OR "bounty" OR "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913") python -MRG -MergeOS -label:bounty-alert -author:app/github-actions',
-        'is:issue is:open ("algora-pbc" OR "opire-bot" OR "💎" OR "/bounty") "python" ("USDC" OR "$") -MRG -MergeOS -label:bounty-alert -author:app/github-actions',
-    )
+    DEFAULT_QUERIES: tuple[str, ...] = THREE_QUERY_DISCOVERY_FUNNEL
 
     def __init__(
         self,
@@ -876,6 +991,7 @@ class BaseUSDCBountyPoller(BountyBoardAdapter):
         self.settings = settings or get_settings()
         self._client = http_client
         self.search_queries = tuple(search_queries) if search_queries else self.DEFAULT_QUERIES
+        self.last_raw_candidates_fetched: int = 0
 
     def _headers(self) -> dict[str, str]:
         headers = {
@@ -887,27 +1003,37 @@ class BaseUSDCBountyPoller(BountyBoardAdapter):
         return headers
 
     async def fetch_open_bounties(self) -> list[BountyOpportunity]:
-        """Query crypto-native Base USDC and escrowed USDC bounty queries on GitHub."""
+        """Execute the 3-query discovery funnel and inspect issue comments for official escrow confirmations."""
+        self.last_raw_candidates_fetched = 0
         url = f"{self.settings.GITHUB_API_URL.rstrip('/')}/search/issues"
         close_client = self._client is None
         client = self._client or httpx.AsyncClient(timeout=15.0, follow_redirects=True)
+        headers = self._headers()
         discovered: dict[str, BountyOpportunity] = {}
+        comments_fetched = 0
         try:
             for query in self.search_queries:
                 try:
                     response = await client.get(
                         url,
                         params={"q": query, "per_page": 25, "sort": "updated", "order": "desc"},
-                        headers=self._headers(),
+                        headers=headers,
                     )
                     response.raise_for_status()
                     payload = response.json()
+                    items = payload.get("items", [])
+                    if isinstance(items, list):
+                        self.last_raw_candidates_fetched += len(items)
                     for item in payload.get("items", []):
                         if not isinstance(item, dict) or "pull_request" in item:
                             continue
                         if is_aggregator_or_digest_issue(item):
                             continue
-                        bounty = normalize_github_issue(item)
+                        item_copy = dict(item)
+                        if comments_fetched < MAX_CANDIDATES_PER_CYCLE and item_copy.get("comments_url"):
+                            await fetch_and_attach_issue_comments(client, item_copy, headers)
+                            comments_fetched += 1
+                        bounty = normalize_github_issue(item_copy)
                         if is_non_usdc_ledger_bounty(
                             bounty.title,
                             bounty.body,
@@ -973,6 +1099,7 @@ class BountyScanner:
     ) -> None:
         self.settings = settings or get_settings()
         self.max_candidates_per_cycle = int(max_candidates_per_cycle)
+        self.last_raw_candidates_fetched: int = 0
         self.seen_cache = seen_cache or SeenBountiesCache(
             cache_path=seen_cache_path if adapters is None else None,
             ttl_seconds=seen_ttl_seconds,
@@ -982,7 +1109,6 @@ class BountyScanner:
         else:
             self.adapters = [
                 AlgoraBountyPoller(settings=self.settings),
-                GitHubEscrowBountyPoller(settings=self.settings),
                 BaseUSDCBountyPoller(settings=self.settings),
             ]
 
@@ -1008,11 +1134,14 @@ class BountyScanner:
         tasks = [adapter.fetch_open_bounties() for adapter in self.adapters]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
+        raw_total = 0
         deduped: dict[str, BountyOpportunity] = {}
-        for res in results:
+        for adapter, res in zip(self.adapters, results):
             if isinstance(res, Exception):
                 logger.warning("Bounty adapter raised exception during scan: %s", res)
                 continue
+            adapter_raw = int(getattr(adapter, "last_raw_candidates_fetched", 0) or 0)
+            raw_total += adapter_raw if adapter_raw > 0 else len(res)
             for bounty in res:
                 if is_aggregator_or_digest_issue(bounty):
                     continue
@@ -1033,6 +1162,7 @@ class BountyScanner:
                 if bounty.bounty_id not in deduped:
                     deduped[bounty.bounty_id] = bounty
 
+        self.last_raw_candidates_fetched = raw_total
         ordered = list(deduped.values())
         ordered.sort(
             key=lambda b: (
@@ -1049,8 +1179,8 @@ class BountyScanner:
         triage_evaluator: Any,
         max_candidates: int | None = None,
     ) -> tuple[BountyOpportunity | None, Any | None, list[dict[str, Any]]]:
-        """Iterate through up to 15 unseen candidate issues per poll cycle, pre-filtering for verified escrow bot
-        signatures/USDC markers and caching every rejected bounty_id in seen_bounties until one is approved.
+        """Iterate through up to 15 unseen candidate issues per poll cycle, verifying escrow via issue comments
+        or USDC links and caching every rejected bounty_id in seen_bounties until one is approved.
         """
         limit = int(max_candidates or self.max_candidates_per_cycle)
         unseen_candidates = await self.scan_all(verified_only=False, skip_seen=True)
@@ -1058,7 +1188,7 @@ class BountyScanner:
 
         evaluated_log: list[dict[str, Any]] = []
         for candidate in batch:
-            # Direct pre-filter for verified escrow bot signatures or explicit USDC/Base escrow markers
+            # Direct pre-filter for verified escrow bot signatures or verified USDC escrow links
             if not (candidate.escrow_verified and has_verified_escrow_signature_or_marker(candidate)):
                 self.mark_seen(candidate.bounty_id, status="rejected_unverified_escrow_marker")
                 evaluated_log.append(
@@ -1068,8 +1198,8 @@ class BountyScanner:
                         "escrow_verified": False,
                         "security_rejected": False,
                         "reason": (
-                            "Rejected before triage: missing verified escrow bot signature "
-                            "(e.g., algora-pbc[bot], opire-bot[bot]) or explicit USDC/Base escrow marker."
+                            "Rejected before triage: missing official escrow bot confirmation "
+                            "(algora-pbc[bot], opire-bot[bot], polar-sh[bot]) or verified USDC escrow link."
                         ),
                         "bounty": candidate,
                         "triage": None,
