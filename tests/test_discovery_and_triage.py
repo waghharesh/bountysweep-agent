@@ -425,7 +425,7 @@ async def test_aggregator_digest_filter_and_verified_escrow_bot_signatures() -> 
     }
     assert is_aggregator_or_digest_issue(bounty_alert_label_issue) is True
 
-    # 2. Verified escrow bot signatures detected
+    # 2. Verified escrow bot signatures detected via comments_list
     algora_bot_issue = normalize_github_issue(
         {
             "number": 201,
@@ -433,7 +433,10 @@ async def test_aggregator_digest_filter_and_verified_escrow_bot_signatures() -> 
             "repo_name": "api",
             "title": "Fix async FastAPI middleware timeout ($175)",
             "body": "Reproduce with pytest and fix timeout handling.",
-            "user": {"login": "algora-pbc[bot]"},
+            "user": {"login": "maintainer"},
+            "comments_list": [
+                {"user": {"login": "algora-pbc[bot]"}, "body": "💎 $175.00 bounty escrowed via Algora."}
+            ],
             "labels": ["bounty", "python", "fastapi"],
         }
     )

@@ -80,7 +80,7 @@ class DockerSandboxRunner:
     """
 
     DEFAULT_PYTEST_COMMAND: list[str] = ["pytest", "-q", "--tb=short"]
-    UNITTEST_DISCOVER_COMMAND: list[str] = ["python", "-m", "unittest", "discover", "-v"]
+    UNITTEST_DISCOVER_COMMAND: list[str] = ["python", "-m", "unittest", "discover"]
 
     def __init__(
         self,
@@ -477,8 +477,13 @@ class DockerSandboxRunner:
             raise
 
         container = None
+        run_kwargs = (
+            {k: v for k, v in container_kwargs.items() if k != "nano_cpus"}
+            if ("cpu_period" in container_kwargs or "cpu_quota" in container_kwargs)
+            else dict(container_kwargs)
+        )
         try:
-            container = client.containers.run(**container_kwargs)
+            container = client.containers.run(**run_kwargs)
         except DockerException:
             if self.allow_local_fallback and self._docker_client is None:
                 logger.info(

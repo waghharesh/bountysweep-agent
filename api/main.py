@@ -265,17 +265,11 @@ class BountySweepOrchestrator:
             bounty = approved_bounty
             triage_result = approved_triage
 
-        # Step 3: Claim Bounty with Worker Hot Wallet & Send [Bounty Claimed] Alert
+        # Step 3: Sign Task Claim & Execute Patch in Ephemeral Isolated Sandbox
         wallet_router = self._get_wallet_router()
         claim_receipt = wallet_router.sign_task_claim(
             bounty_id=bounty.bounty_id,
             submission_url=bounty.issue_url,
-        )
-        await self.telegram_bot.alert_bounty_claimed(
-            bounty_id=bounty.bounty_id,
-            title=bounty.title,
-            reward_usdc=bounty.reward_usdc,
-            issue_url=bounty.issue_url,
         )
 
         # Step 4: Generate Patch & Execute Tests in Ephemeral Isolated Sandbox
@@ -309,7 +303,13 @@ class BountySweepOrchestrator:
             self.cycle_history.append(result)
             return result
 
-        # Step 5: Submit Solution PR (or log draft in DRY_RUN_MODE) & Alert
+        # Step 5: Send [Bounty Claimed] & Submit Solution PR (or log draft in DRY_RUN_MODE)
+        await self.telegram_bot.alert_bounty_claimed(
+            bounty_id=bounty.bounty_id,
+            title=bounty.title,
+            reward_usdc=bounty.reward_usdc,
+            issue_url=bounty.issue_url,
+        )
         pr_url = f"{bounty.repo_url.rstrip('/')}/pull/{bounty.issue_number + 100}"
         await self.telegram_bot.alert_solution_submitted(
             bounty_id=bounty.bounty_id,

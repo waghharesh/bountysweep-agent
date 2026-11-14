@@ -274,16 +274,28 @@ class SeenBountiesCache:
         return dict(self._entries)
 
 
+_ALREADY_AWARDED_COMMENT_RE = re.compile(
+    r"(?:has\s+been\s+awarded|console\.algora\.io/awards/|🎉🎈|bounty\s+has\s+been\s+(?:paid|claimed\s+and\s+closed))",
+    re.IGNORECASE,
+)
+
+_PR_CLAIM_ONLY_COMMENT_RE = re.compile(
+    r"💡\s*@[A-Za-z0-9_.-]+\s+submitted\s+a\s+\[pull\s+request\]",
+    re.IGNORECASE,
+)
+
+
 def is_aggregator_or_digest_issue(
     issue_data_or_bounty: dict[str, Any] | BountyOpportunity,
 ) -> bool:
-    """Return True if an issue is created by github-actions[bot], labeled 'bounty-alert', or is an aggregator digest."""
+    """Return True if an issue is created by github-actions[bot], labeled 'bounty-alert', or is an aggregator/mirror digest."""
     if isinstance(issue_data_or_bounty, BountyOpportunity):
         raw = issue_data_or_bounty.raw_metadata or {}
         labels = [lbl.strip().lower() for lbl in issue_data_or_bounty.labels]
         title = issue_data_or_bounty.title
         body = issue_data_or_bounty.body
         repo_owner = issue_data_or_bounty.repo_owner
+        repo_name = issue_data_or_bounty.repo_name
     else:
         raw = issue_data_or_bounty
         raw_labels = raw.get("labels") or []
@@ -296,6 +308,7 @@ def is_aggregator_or_digest_issue(
         title = str(raw.get("title") or "")
         body = str(raw.get("body") or "")
         repo_owner = str(raw.get("repo_owner") or "")
+        repo_name = str(raw.get("repo_name") or "")
 
     user_obj = raw.get("user") or raw.get("author") or {}
     user_login = (
@@ -309,9 +322,13 @@ def is_aggregator_or_digest_issue(
     if any(lbl in AGGREGATOR_LABELS for lbl in labels):
         return True
 
-    combined = f"{title}\n{body}\n{repo_owner}"
+    combined = f"{title}\n{body}\n{repo_owner}\n{repo_name}"
     if re.search(
-        r"(?:\bBountyScout\b|\bAF\s+alert:\s*\d+\s+new\s+paid\s+opportunit|🎯\s*Bounty\s+Alert:)",
+        r"(?:\bBountyScout\b|\bAF\s+alert:\s*\d+\s+new\s+paid\s+opportunit|"
+        r"🎯\s*Bounty\s+Alert:|Active\s+Bounty\s+Scan\s+Results|"
+        r"Automated\s+CI\s+Conformance\s+Mirror\s+Notice|"
+        r"specification\s+relay\s+issue|"
+        r"manual\s+pull\s+requests\s+from\s+human\s+engineers\s+are\s+not\s+reviewed\s+on\s+this\s+mirror)",
         combined,
         re.IGNORECASE,
     ):
@@ -320,11 +337,12 @@ def is_aggregator_or_digest_issue(
     return False
 
 
-def _extract_comments_metadata(raw: dict[str, Any]) -> tuple[list[str], list[str]]:
-    """Extract lowercase comment author logins and comment body strings from issue raw metadata."""
+def _extract_comments_metadata(raw: dict[str, Any]) -> tuple[list[str], list[str], list[str]]:
+    """Extract lowercase comment author logins, all comment bodies, and verified-bot-only comment bodies."""
     comments_list = raw.get("comments_list") or raw.get("comments_data") or []
     comment_logins: list[str] = []
     comment_bodies: list[str] = []
+    bot_comment_bodies: list[str] = []
     if isinstance(comments_list, list):
         for comment in comments_list:
             if isinstance(comment, dict):
@@ -339,7 +357,9 @@ def _extract_comments_metadata(raw: dict[str, Any]) -> tuple[list[str], list[str
                     comment_logins.append(c_login)
                 if c_body:
                     comment_bodies.append(c_body)
-    return comment_logins, comment_bodies
+                if c_login in VERIFIED_ESCROW_BOT_LOGINS and c_body:
+                    bot_comment_bodies.append(c_body)
+    return comment_logins, comment_bodies, bot_comment_bodies
 
 
 def has_verified_escrow_signature_or_marker(
@@ -347,8 +367,8 @@ def has_verified_escrow_signature_or_marker(
 ) -> bool:
     """Strictly verify escrow: never accept links or 'Held in escrow' text in the issue body alone.
 
-    Requires at least one comment in comments_list authored specifically by a verified escrow bot login
-    (algora-pbc[bot], opire-bot[bot], or polar-sh[bot]), or a verified on-chain / Algora escrow API response.
+    Requires comments_list to contain an active (unclaimed/unawarded) comment authored specifically by
+    'algora-pbc[bot]', 'opire-bot[bot]', or 'polar-sh[bot]' (or a direct on-chain/Algora API response).
     """
     if isinstance(issue_data_or_bounty, BountyOpportunity):
         bounty = issue_data_or_bounty
@@ -374,31 +394,33 @@ def has_verified_escrow_signature_or_marker(
     if _PROMISE_TO_PAY_RE.search(combined_issue):
         return False
 
-    # 1. Check issue comments for a comment authored specifically by algora-pbc[bot], opire-bot[bot], or polar-sh[bot]
-    comment_logins, _ = _extract_comments_metadata(raw)
-    for c_login in comment_logins:
-        if c_login in VERIFIED_ESCROW_BOT_LOGINS:
+    # 1. Check comments_list for a comment authored specifically by algora-pbc[bot], opire-bot[bot], or polar-sh[bot]
+    comments_list = raw.get("comments_list") or raw.get("comments_data") or []
+    if isinstance(comments_list, list) and comments_list:
+        has_active_bot_comment = False
+        for comment in comments_list:
+            if not isinstance(comment, dict):
+                continue
+            c_user = comment.get("user") or comment.get("author") or {}
+            c_login = (
+                str(c_user.get("login") if isinstance(c_user, dict) else c_user or "")
+                .strip()
+                .lower()
+            )
+            c_body = str(comment.get("body") or "")
+            if c_login in VERIFIED_ESCROW_BOT_LOGINS:
+                if _ALREADY_AWARDED_COMMENT_RE.search(c_body):
+                    return False
+                if not _PR_CLAIM_ONLY_COMMENT_RE.search(c_body):
+                    has_active_bot_comment = True
+        if has_active_bot_comment:
             return True
 
     # 2. Check verified on-chain escrow API response or direct Algora API /bounties payload
-    if platform == "onchain" or bool(raw.get("onchain_escrow_verified")) or bool(raw.get("escrow_contract")):
+    if platform == "onchain":
         return True
 
     if platform == "algora" and ("id" in raw or "reward_cents" in raw or "status" in raw):
-        return True
-
-    # 3. Check if the issue itself was authored directly by an official escrow bot or tagged in metadata
-    user_obj = raw.get("user") or raw.get("author") or {}
-    user_login = (
-        str(user_obj.get("login") if isinstance(user_obj, dict) else user_obj or "")
-        .strip()
-        .lower()
-    )
-    if user_login in VERIFIED_ESCROW_BOT_LOGINS:
-        return True
-
-    escrow_bot = str(raw.get("escrow_bot") or raw.get("bot_signature") or "").strip().lower()
-    if escrow_bot in VERIFIED_ESCROW_BOT_LOGINS:
         return True
 
     return False
@@ -471,8 +493,7 @@ def normalize_github_issue(issue_data: dict[str, Any]) -> BountyOpportunity:
     """Normalize a GitHub REST or GraphQL issue payload into a BountyOpportunity.
 
     Strictly verifies escrow via comments authored by official escrow bots (algora-pbc[bot], opire-bot[bot],
-    polar-sh[bot]) or verified on-chain escrow API responses. Never marks escrow_verified=True based on
-    links or 'Held in escrow' text in the issue body alone.
+    polar-sh[bot]). Never marks escrow_verified=True based on links or 'Held in escrow' text in the issue body.
     """
     raw_labels = issue_data.get("labels", [])
     if isinstance(raw_labels, dict) and "nodes" in raw_labels:
@@ -530,23 +551,29 @@ def normalize_github_issue(issue_data: dict[str, Any]) -> BountyOpportunity:
     if not html_url:
         html_url = f"{repo_url}/issues/{issue_number}"
 
-    comment_logins, comment_bodies = _extract_comments_metadata(issue_data)
-    comments_text = "\n".join(comment_bodies)
+    comment_logins, _, bot_comment_bodies = _extract_comments_metadata(issue_data)
+    bot_comments_text = "\n".join(bot_comment_bodies)
 
     # Check non-USDC ledger token or aggregator/digest filter
     non_usdc_or_aggregator = is_non_usdc_ledger_bounty(
         title, body, labels, repo_owner=repo_owner
-    ) or is_aggregator_or_digest_issue(issue_data)
+    ) or is_aggregator_or_digest_issue(
+        {
+            **issue_data,
+            "repo_owner": repo_owner,
+            "repo_name": repo_name,
+        }
+    )
 
-    # Parse reward from explicit metadata, labels, issue body, or escrow bot comments
+    # Parse reward from explicit metadata, verified escrow bot comments, labels, or issue body
     reward_usdc = 0.0
     if "reward_usdc" in issue_data and issue_data["reward_usdc"] is not None:
         reward_usdc = float(issue_data["reward_usdc"])
     elif "reward_cents" in issue_data and issue_data["reward_cents"] is not None:
         reward_usdc = round(float(issue_data["reward_cents"]) / 100.0, 2)
     elif not non_usdc_or_aggregator:
-        if comments_text:
-            reward_usdc = parse_reward_usd_from_text(comments_text)
+        if bot_comments_text:
+            reward_usdc = parse_reward_usd_from_text(bot_comments_text)
         if reward_usdc <= 0:
             for lbl in labels:
                 amt = parse_reward_usd_from_text(lbl)
@@ -560,35 +587,23 @@ def normalize_github_issue(issue_data: dict[str, Any]) -> BountyOpportunity:
     has_promise_to_pay = bool(_PROMISE_TO_PAY_RE.search(combined_issue_text))
 
     escrow_provider: str | None = issue_data.get("escrow_provider")
-    user_obj = issue_data.get("user") or issue_data.get("author") or {}
-    user_login = (
-        str(user_obj.get("login") if isinstance(user_obj, dict) else user_obj or "")
-        .strip()
-        .lower()
-    )
-    escrow_bot = str(issue_data.get("escrow_bot") or issue_data.get("bot_signature") or "").strip().lower()
-    all_bot_logins = [user_login, escrow_bot, *comment_logins]
-
     if not escrow_provider:
-        if any(login == "algora-pbc[bot]" for login in all_bot_logins):
+        if any(login == "algora-pbc[bot]" for login in comment_logins):
             escrow_provider = "algora"
-        elif any(login == "opire-bot[bot]" for login in all_bot_logins):
+        elif any(login == "opire-bot[bot]" for login in comment_logins):
             escrow_provider = "opire"
-        elif any(login == "polar-sh[bot]" for login in all_bot_logins):
+        elif any(login == "polar-sh[bot]" for login in comment_logins):
             escrow_provider = "polar"
 
     has_verified_marker = has_verified_escrow_signature_or_marker(issue_data)
 
     # If an official escrow bot comment (algora-pbc[bot], opire-bot[bot], polar-sh[bot]) confirmed escrow
     # via an SVG badge where the dollar amount is embedded in an image URL rather than plain text, assign a floor
-    has_official_bot_confirmation = any(
-        login in VERIFIED_ESCROW_BOT_LOGINS for login in all_bot_logins if login
-    )
     if (
         not non_usdc_or_aggregator
         and not has_promise_to_pay
         and reward_usdc <= 0
-        and has_official_bot_confirmation
+        and has_verified_marker
     ):
         reward_usdc = 50.0
 
@@ -609,7 +624,7 @@ def normalize_github_issue(issue_data: dict[str, Any]) -> BountyOpportunity:
         or f"github:{repo_owner}/{repo_name}#{issue_number}"
     )
 
-    tech_tags = issue_data.get("tech_tags") or extract_tech_tags(title, f"{body}\n{comments_text}", labels)
+    tech_tags = issue_data.get("tech_tags") or extract_tech_tags(title, body, labels)
 
     return BountyOpportunity(
         bounty_id=bounty_id,
@@ -1057,6 +1072,12 @@ def generate_mock_escrowed_bounty() -> BountyOpportunity:
             "mock": True,
             "escrow_contract": "algora_verified_v2",
             "escrow_bot": "algora-pbc[bot]",
+            "comments_list": [
+                {
+                    "user": {"login": "algora-pbc[bot]"},
+                    "body": "💎 $150.00 bounty escrowed via Algora [escrow:verified]",
+                }
+            ],
         },
     )
 

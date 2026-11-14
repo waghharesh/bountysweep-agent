@@ -70,21 +70,32 @@ _UNFUNDED_BODY_RE = re.compile(
 )
 
 _CROSS_REPO_PR_NOT_REVIEWED_RE = re.compile(
-    r"(?:PRs?\s+(?:are\s+)?not\s+(?:reviewed|accepted|merged)\s+(?:on|in|at|here)\b|"
-    r"pull\s+requests?\s+(?:are\s+)?not\s+(?:reviewed|accepted|merged)\s+(?:on|in|at|here)\b|"
+    r"(?:(?:PRs?|pull\s+requests?)(?:\s+from\s+[^\n.;,]+)?\s+(?:are\s+)?not\s+(?:reviewed|accepted|merged)\s+(?:on|in|at|here)\b|"
     r"do\s+not\s+(?:open|submit|create)\s+(?:a\s+)?(?:PR|pull\s+request)s?\s+(?:on|to|in)\s+this\s+repo|"
     r"submit\s+(?:your\s+)?(?:PR|pull\s+request)s?\s+to\s+(?:the\s+)?upstream|"
     r"this\s+(?:repo(?:sitory)?|issue)\s+is\s+(?:only\s+)?a\s+(?:mirror|relay)|"
-    r"bounty\s+(?:mirror|relay)\s+repo(?:sitory)?)",
+    r"bounty\s+(?:mirror|relay)\s+repo(?:sitory)?|"
+    r"Automated\s+CI\s+Conformance\s+Mirror\s+Notice|"
+    r"specification\s+relay\s+issue)",
     re.IGNORECASE,
 )
 
 _CLONE_OR_TARGET_REPO_RE = re.compile(
-    r"(?:git\s+clone\s+(?:--depth\s+\d+\s+)?(?:https?:\/\/github\.com\/|git@github\.com:)|"
-    r"\bclone\s+(?:the\s+)?(?:repo(?:sitory)?\s+)?https?:\/\/github\.com\/|"
-    r"(?:target|upstream|source|actual)\s+repo(?:sitory)?\s*[:=-]?\s*https?:\/\/github\.com\/|"
-    r"(?:open|submit|send)\s+(?:a\s+|your\s+)?(?:PR|pull\s+request)s?\s+(?:to|on|in|against)\s+https?:\/\/github\.com\/)"
+    r"(?:git\s+clone\s+(?:--depth\s+\d+\s+)?(?:https?:\/\/github\.com\/|git@github\.com:)?[`'\"]?|"
+    r"\bclone\s+(?:the\s+)?(?:repo(?:sitory)?\s+)?(?:https?:\/\/github\.com\/)?[`'\"]?|"
+    r"(?:target|upstream|source|actual)\s+repo(?:sitory)?\s*[:=-]?\s*(?:https?:\/\/github\.com\/)?[`'\"]?|"
+    r"(?:open|submit|send)\s+(?:a\s+|your\s+)?(?:PR|pull\s+request)s?\s+(?:to|on|in|against)\s+(?:https?:\/\/github\.com\/)?[`'\"]?)"
     r"([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)",
+    re.IGNORECASE,
+)
+
+_ALREADY_AWARDED_COMMENT_RE = re.compile(
+    r"(?:has\s+been\s+awarded|console\.algora\.io/awards/|🎉🎈|bounty\s+has\s+been\s+(?:paid|claimed\s+and\s+closed))",
+    re.IGNORECASE,
+)
+
+_PR_CLAIM_ONLY_COMMENT_RE = re.compile(
+    r"💡\s*@[A-Za-z0-9_.-]+\s+submitted\s+a\s+\[pull\s+request\]",
     re.IGNORECASE,
 )
 
@@ -196,7 +207,9 @@ def _normalize_owner_repo(repo_url: str, fallback_owner: str = "", fallback_name
 
 
 def is_cross_repo_mirror_or_relay_issue(bounty: BountyOpportunity) -> tuple[bool, str]:
-    """Detect mirror/relay issues that state PRs are not reviewed on the issue's repo or instruct cloning a different repo."""
+    """Detect mirror/relay/digest issues (github-actions[bot], bounty-alert, non-USDC MRG, or cross-repo clone instructions)."""
+    from discovery.scanner import is_aggregator_or_digest_issue, is_non_usdc_ledger_bounty
+
     raw = bounty.raw_metadata or {}
     comments_list = raw.get("comments_list") or raw.get("comments_data") or []
     comment_bodies = [
@@ -218,33 +231,47 @@ def is_cross_repo_mirror_or_relay_issue(bounty: BountyOpportunity) -> tuple[bool
         target_repo = clone_match.group(1).rstrip("/")
         if target_repo.lower().endswith(".git"):
             target_repo = target_repo[:-4]
-        target_repo = target_repo.rstrip(".,;:)'\"]")
+        target_repo = target_repo.rstrip(".,;:)'\"`]")
+        if re.search(r"\.(?:py|sh|js|ts|md|json|ya?ml|toml|txt)$", target_repo, re.IGNORECASE):
+            continue
         if own_repo and target_repo.lower() != own_repo:
             return (
                 True,
                 f"Rejected: Cross-repo mirror/relay issue instructs cloning or targeting '{target_repo}' instead of issue repository '{own_repo}'.",
             )
 
+    if is_aggregator_or_digest_issue(bounty):
+        return (
+            True,
+            "Rejected: Issue is an automated aggregator/digest or mirror alert (e.g., github-actions[bot] or 'bounty-alert').",
+        )
+
+    if is_non_usdc_ledger_bounty(
+        bounty.title, bounty.body, bounty.labels, repo_owner=bounty.repo_owner
+    ):
+        return (
+            True,
+            "Rejected: Issue rewards non-USDC ledger/points tokens (such as MergeOS MRG) rather than escrowed USDC.",
+        )
+
     return False, ""
 
 
 def verify_strict_bot_or_onchain_escrow(bounty: BountyOpportunity) -> tuple[bool, str]:
-    """Strictly verify escrow: never accept links or 'Held in escrow' text in the issue body alone.
-
-    Requires at least one comment in comments_list authored specifically by a verified escrow bot login
-    (algora-pbc[bot], opire-bot[bot], or polar-sh[bot]), or a verified on-chain escrow API response.
+    """Strictly verify escrow: escrow_verified=True ONLY when comments_list contains a comment authored by
+    'algora-pbc[bot]', 'opire-bot[bot]', or 'polar-sh[bot]'. Never trust issue body text or links.
     """
-    if bounty.reward_usdc <= 0 or not bounty.escrow_verified:
+    if bounty.reward_usdc <= 0:
         return (
             False,
-            "Rejected: Bounty lacks verified escrow funding or has a non-positive USDC reward.",
+            "Rejected: Bounty lacks a positive USDC reward.",
         )
 
     raw = bounty.raw_metadata or {}
-
-    # 1. Check comments_list for a comment authored specifically by algora-pbc[bot], opire-bot[bot], or polar-sh[bot]
     comments_list = raw.get("comments_list") or raw.get("comments_data") or []
-    if isinstance(comments_list, list):
+    if isinstance(comments_list, list) and comments_list:
+        has_active_bot_comment = False
+        matched_bot = ""
         for comment in comments_list:
             if not isinstance(comment, dict):
                 continue
@@ -254,38 +281,23 @@ def verify_strict_bot_or_onchain_escrow(bounty: BountyOpportunity) -> tuple[bool
                 .strip()
                 .lower()
             )
+            c_body = str(comment.get("body") or "")
             if c_login in STRICT_ESCROW_BOT_LOGINS:
-                return True, f"Verified via official escrow bot comment ({c_login})."
-
-    # 2. Check verified on-chain escrow API response or direct official escrow API payload
-    if bounty.platform == "onchain":
-        return True, "Verified via on-chain escrow task board API response."
-
-    if bool(raw.get("onchain_escrow_verified")) or bool(raw.get("escrow_contract")):
-        return True, "Verified via on-chain escrow contract metadata."
-
-    escrow_bot = str(raw.get("escrow_bot") or "").strip().lower()
-    if escrow_bot in STRICT_ESCROW_BOT_LOGINS:
-        return True, f"Verified via official escrow bot metadata ({escrow_bot})."
-
-    user_obj = raw.get("user") or raw.get("author") or {}
-    issue_author_login = (
-        str(user_obj.get("login") if isinstance(user_obj, dict) else user_obj or "")
-        .strip()
-        .lower()
-    )
-    if issue_author_login in STRICT_ESCROW_BOT_LOGINS:
-        return True, f"Verified via official escrow bot author ({issue_author_login})."
-
-    # Direct Algora API /bounties endpoint responses have platform == 'algora' and status/id fields
-    if bounty.platform == "algora" and ("id" in raw or "reward_cents" in raw or "status" in raw):
-        return True, "Verified via Algora API response."
+                if _ALREADY_AWARDED_COMMENT_RE.search(c_body):
+                    return (
+                        False,
+                        f"Rejected: Bounty was already awarded/paid according to {c_login}.",
+                    )
+                if not _PR_CLAIM_ONLY_COMMENT_RE.search(c_body):
+                    has_active_bot_comment = True
+                    matched_bot = c_login
+        if has_active_bot_comment:
+            return True, f"Verified via official escrow bot comment ({matched_bot})."
 
     return (
         False,
-        "Rejected: Never mark escrow_verified=True based on links or 'Held in escrow' text in the issue body. "
-        "Requires at least one comment in comments_list authored by algora-pbc[bot], opire-bot[bot], or polar-sh[bot], "
-        "or a verified on-chain escrow API response.",
+        "Rejected: escrow_verified=True ONLY when comments_list contains a comment authored by "
+        "'algora-pbc[bot]', 'opire-bot[bot]', or 'polar-sh[bot]' (never trust issue body text or links).",
     )
 
 
@@ -309,7 +321,7 @@ class BountyTriageEngine:
             return None
         self._genai_client = genai.Client(
             api_key=api_key,
-            http_options=types.HttpOptions(api_version="v1beta", timeout=15000),
+            http_options=types.HttpOptions(api_version="v1beta", timeout=45000),
         )
         return self._genai_client
 
@@ -369,7 +381,7 @@ class BountyTriageEngine:
         return tech_score, solvability_score, rationale, patch_plan
 
     async def evaluate_bounty(self, bounty: BountyOpportunity) -> TriageResult:
-        """Evaluate a bounty opportunity for security, cross-repo mirror rejection, strict bot escrow, and technical fit."""
+        """Evaluate a bounty opportunity for security, cross-repo mirror/digest rejection, strict bot comment escrow, and technical fit."""
         # Step 1: Mandatory security & prompt-injection screening
         is_malicious, security_reasons = screen_for_malicious_intent(
             title=bounty.title,
@@ -392,9 +404,9 @@ class BountyTriageEngine:
                 suggested_patch_plan="",
             )
 
-        # Step 2: Reject cross-repo mirror/relay issues before escrow or LLM evaluation
-        is_mirror, mirror_reason = is_cross_repo_mirror_or_relay_issue(bounty)
-        if is_mirror:
+        # Step 2: Reject cross-repo mirror/relay, aggregator/digest ('github-actions[bot]', 'bounty-alert'), or non-USDC issues before claiming
+        is_mirror_or_digest, mirror_reason = is_cross_repo_mirror_or_relay_issue(bounty)
+        if is_mirror_or_digest:
             return TriageResult(
                 bounty_id=bounty.bounty_id,
                 total_score=0,
@@ -409,7 +421,7 @@ class BountyTriageEngine:
                 suggested_patch_plan="",
             )
 
-        # Step 3: Mandatory strict bot-authored or on-chain escrow verification
+        # Step 3: Mandatory strict bot-authored comment escrow verification
         has_unfunded_language = bool(_UNFUNDED_BODY_RE.search(f"{bounty.title}\n{bounty.body}"))
         strict_escrow_ok, strict_escrow_reason = verify_strict_bot_or_onchain_escrow(bounty)
         if not strict_escrow_ok or has_unfunded_language:
@@ -431,9 +443,10 @@ class BountyTriageEngine:
                 suggested_patch_plan="",
             )
 
-        funding_score = self._compute_funding_score(bounty)
+        verified_bounty = bounty.model_copy(update={"escrow_verified": True})
+        funding_score = self._compute_funding_score(verified_bounty)
         tech_score, solvability_score, rationale, patch_plan = (
-            self._compute_heuristic_tech_and_solvability(bounty)
+            self._compute_heuristic_tech_and_solvability(verified_bounty)
         )
 
         # Step 4: Optional live Gemini refinement when API key is configured

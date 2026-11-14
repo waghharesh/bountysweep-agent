@@ -52,9 +52,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Pre-pull Isolated Sandbox Base Image
+      - name: Pre-build Isolated Sandbox Base Image (with pytest)
         run: |
-          docker pull python:3.12-slim
+          docker build -t python:3.12-slim - <<'EOF'
+          FROM python:3.12-slim
+          RUN pip install --no-cache-dir pytest
+          EOF
 
       - name: Run Autonomous BountySweep Cycle
         env:
