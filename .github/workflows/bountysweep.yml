@@ -1,6 +1,9 @@
 name: BountySweep Autonomous Cloud Agent
 
 on:
+  push:
+    branches:
+      - main
   schedule:
     # Runs automatically every 30 minutes on GitHub's free Ubuntu VMs (with Docker pre-installed)
     - cron: "*/30 * * * *"
