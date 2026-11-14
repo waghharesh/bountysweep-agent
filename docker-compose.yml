@@ -1,0 +1,31 @@
+version: "3.9"
+
+services:
+  bountysweep-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bountysweep-agent
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - DRY_RUN_MODE=${DRY_RUN_MODE:-true}
+      - CHAIN_NETWORK=${CHAIN_NETWORK:-base}
+      - SWEEP_THRESHOLD_USDC=${SWEEP_THRESHOLD_USDC:-5.0}
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount Docker socket so sandbox/runner.py can spawn isolated sibling containers
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+      - bountysweep-workspaces:/tmp/bountysweep_workspaces
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+
+volumes:
+  bountysweep-workspaces:

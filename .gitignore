@@ -1,0 +1,27 @@
+# Ignore everything in home directory by default except BountySweep project files
+/*
+!/config/
+!/discovery/
+!/evaluator/
+!/sandbox/
+!/payouts/
+!/notifications/
+!/api/
+!/tests/
+!/.github/
+!/.env.example
+!/.gitignore
+!/Dockerfile
+!/docker-compose.yml
+!/pyproject.toml
+!/requirements.txt
+!/README.md
+!/run_autonomous_cycle.py
+
+# Never commit Python bytecode or caches inside tracked directories
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+.env
